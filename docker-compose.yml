@@ -1,0 +1,24 @@
+services:
+  portico:
+    build: .
+    container_name: portico
+    restart: unless-stopped
+    # Host networking lets the dashboard reach both sibling containers'
+    # published ports (via localhost) and tailnet peers' 100.x IPs directly,
+    # without extra routing. It also means the container shares the host's
+    # network namespace — only run trusted code here.
+    network_mode: host
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock:ro
+    environment:
+      - PORT=8080
+      - SITE_TITLE=Home
+      - DATA_DIR=/data
+      - DISCOVERY_INTERVAL=5s
+      - PROBE_TIMEOUT=1500ms
+      - PROBE_CONCURRENCY=40
+      - DOCKER_SOCKET=/var/run/docker.sock
+      - TAILSCALE_SOCKET=/var/run/tailscale/tailscaled.sock
+      # - PORTS=80,443,3000,8080,8096,8123

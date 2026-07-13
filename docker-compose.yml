@@ -1,6 +1,8 @@
 services:
   portico:
-    build: .
+    image: ghcr.io/jeremysball/portico:latest
+    # Uncomment to build from source instead of pulling the published image:
+    # build: .
     container_name: portico
     restart: unless-stopped
     # Host networking lets the dashboard reach both sibling containers'

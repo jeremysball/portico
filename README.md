@@ -1,5 +1,8 @@
 # Portico
 
+[![CI](https://github.com/jeremysball/portico/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremysball/portico/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A small, self-updating landing page for your self-hosted services. No YAML
 to hand-maintain — point it at your Tailscale socket and Docker socket and
 it finds things on its own:
@@ -15,8 +18,14 @@ coming online, pushed to the browser live over SSE — no refresh needed.
 ## Quickstart
 
 ```sh
-docker compose up -d --build
+curl -O https://raw.githubusercontent.com/jeremysball/portico/main/docker-compose.yml
+docker compose up -d
 ```
+
+This pulls the published image (`ghcr.io/jeremysball/portico:latest`) rather
+than building from source. To build locally instead, clone the repo and
+uncomment `build: .` in `docker-compose.yml` (or run `docker compose up -d
+--build`).
 
 Then open `http://<this-host>:8080`.
 
@@ -39,6 +48,13 @@ It also mounts, read-only:
 
 Either mount is optional — if a socket isn't present, that discovery source
 is silently skipped.
+
+> **Note:** this repo (and therefore its GHCR package) is currently
+> **private**. The published-image pull above will only work for you and
+> anyone else with repo access until it's made public. Flipping the repo to
+> public does *not* automatically make the package public — that's a
+> separate toggle under the package's own Settings → Danger Zone → Change
+> visibility on GHCR.
 
 ## Labeling Docker containers
 
@@ -101,3 +117,7 @@ go build ./...
 go vet ./...
 go run ./cmd/portico
 ```
+
+## License
+
+[MIT](LICENSE)

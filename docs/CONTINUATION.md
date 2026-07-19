@@ -61,14 +61,33 @@ all pass) and was committed to `origin/main`.
 
 ## Not yet done / needs your attention
 
-- **The running production container has not been redeployed.** Pushing to
-  `main` triggers `.github/workflows/release.yml`, which rebuilds and
-  republishes `ghcr.io/jeremysball/portico:latest` — but the host still
-  needs `docker compose pull && docker compose up -d` (or equivalent) to
-  actually pick it up. Until that happens, the tailnet RST storm described
-  in the investigation doc is **still occurring at the old 5-second, un-split
-  cadence**, since the container currently running (as of this session) is
-  the pre-fix build.
+- **CORRECTION from earlier in this session:** I originally said pushing to
+  `main` republishes `ghcr.io/jeremysball/portico:latest` and you'd just
+  need a manual `docker compose pull`. That was wrong. `origin/main`'s
+  current `.github/workflows/release.yml` tags branch-push builds as
+  `:main` (via `type=ref,event=branch`) — `latest=auto` only fires on
+  semver tags — so **pushes to main have never actually updated
+  `:latest`**. The tailnet fix has not reached GHCR at all yet.
+  There's a separate clone at
+  `/srv/containers/coding/workspace/portico` with two commits that were
+  never pushed to `origin/main` and fix exactly this:
+  - `01261d2` — adds a scoped Watchtower service to `docker-compose.yml`
+    that auto-pulls `:latest` and restarts `portico`, making a merge to
+    main an actual deploy.
+  - `ab3963d` — fixes `release.yml` to publish `:latest` + `:sha-<short>`
+    on merge to main, gated on CI passing (the old trigger raced CI).
+  These two commits are NOT an ancestor of the current `origin/main`
+  (`fbe35b6`) — they branch off the older `a826f9d`. Reconciling means
+  cherry-picking/rebasing them onto `fbe35b6` (docker-compose.yml has a
+  small, non-overlapping merge since this session's `TAILNET_INTERVAL`
+  line and Watchtower's `pull_policy`/`labels`/service block touch
+  different regions of the file) and pushing. **This has not been done —
+  ask the user before doing it**, since it changes the production deploy
+  pipeline and CI for a public repo.
+- Until that reconciliation happens and a real deploy occurs, the tailnet
+  RST storm described in the investigation doc is **still occurring at the
+  old 5-second, un-split cadence** — nothing has actually changed in
+  production yet from this whole session's work.
 - **After redeploying, re-run the same measurement** to confirm the fix
   actually worked (validates the investigation's hypothesis with a real
   before/after, not just theory):

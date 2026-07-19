@@ -20,6 +20,7 @@ services:
       - DATA_DIR=/data
       - DISCOVERY_INTERVAL=5s
       - TAILNET_INTERVAL=30s
+      - IDENTIFY_INTERVAL=6h
       - PROBE_TIMEOUT=1500ms
       - PROBE_CONCURRENCY=40
       - DOCKER_SOCKET=/var/run/docker.sock

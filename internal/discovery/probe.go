@@ -10,6 +10,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,6 +80,21 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 	}
 	defer resp.Body.Close()
 
+	// A response that landed (after following redirects) on the *same* host
+	// but a *different* port is just a redirect stub — e.g. :80 bouncing to
+	// :443 on the same box — not a distinct service. Skip it so it doesn't
+	// produce a duplicate tile alongside the port it actually redirects to;
+	// that port gets probed and shown on its own. A redirect to a different
+	// hostname entirely is left alone (could be a legitimate canonical-domain
+	// redirect rather than a same-box stub), even though that's an
+	// imperfect heuristic in either direction.
+	if resp.Request != nil && resp.Request.URL != nil {
+		gotHost, gotPort := hostPort(resp.Request.URL)
+		if gotHost == addr && gotPort != port {
+			return nil, false
+		}
+	}
+
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 
 	// Only trust the scraped title on success responses — error/auth pages
@@ -97,6 +113,22 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 	}
 
 	return &ProbeResult{Scheme: scheme, Title: title, Icon: icon}, true
+}
+
+// hostPort splits a URL into hostname and effective port, filling in the
+// scheme's default port (80/443) when the URL omitted an explicit one —
+// which is exactly what a bare "Location: https://host/" redirect does.
+func hostPort(u *neturl.URL) (string, int) {
+	h := u.Hostname()
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err == nil {
+			return h, n
+		}
+	}
+	if u.Scheme == "https" {
+		return h, 443
+	}
+	return h, 80
 }
 
 func extractIcon(baseURL string, body []byte) string {

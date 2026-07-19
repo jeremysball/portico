@@ -49,6 +49,10 @@ function buildTile() {
   meta.className = "meta";
   a.appendChild(meta);
 
+  const detected = document.createElement("div");
+  detected.className = "detected";
+  a.appendChild(detected);
+
   const history = document.createElement("button");
   history.className = "history-btn";
   history.textContent = "\u{1F550}";
@@ -65,7 +69,7 @@ function buildTile() {
 }
 
 function updateTile(tile, s) {
-  const { el, icon, name, meta, history, edit } = tile;
+  const { el, icon, name, meta, detected, history, edit } = tile;
 
   const wantOffline = !s.online;
   el.classList.toggle("offline", wantOffline);
@@ -96,6 +100,10 @@ function updateTile(tile, s) {
 
   const metaText = `${s.host}:${s.port}`;
   if (meta.textContent !== metaText) meta.textContent = metaText;
+
+  const detectedText = s.detected || "";
+  if (detected.textContent !== detectedText) detected.textContent = detectedText;
+  detected.hidden = !detectedText;
 
   // Rebind each render so the handlers always close over the latest service.
   history.onclick = (e) => {

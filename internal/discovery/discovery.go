@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,47 +17,80 @@ import (
 
 // Config controls the discovery orchestrator.
 type Config struct {
-	Interval        time.Duration // how often to rescan local Docker containers (default 5s)
-	TailnetInterval time.Duration // how often to probe tailnet peers (default 30s; each pass fans out Ports x hosts requests, so this runs far less often than Interval)
-	ProbeTimeout    time.Duration // per-request HTTP timeout (default 1.5s)
-	Concurrency     int           // max in-flight probes (default 40)
-	Ports           []int         // common ports to probe on every tailnet host
-	DockerSocket    string
-	TailscaleSocket string
+	Interval         time.Duration // how often to rescan local Docker containers (default 5s)
+	TailnetInterval  time.Duration // how often to probe tailnet peers (default 30s; each pass fans out Ports x hosts requests, so this runs far less often than Interval)
+	IdentifyInterval time.Duration // how often to run nmap service/version identification against already-online services (default 6h; deliberately rare, this is not a scan)
+	ProbeTimeout     time.Duration // per-request HTTP timeout (default 1.5s)
+	Concurrency      int           // max in-flight probes (default 40)
+	Ports            []int         // common ports to probe on every tailnet host
+	DockerSocket     string
+	TailscaleSocket  string
 }
 
-// Orchestrator ties the three discovery sources together and keeps a
+// Orchestrator ties the discovery sources together and keeps a
 // registry.Registry up to date. Docker (cheap, local) and tailnet (expensive,
 // cross-network) run on independent tickers so a large tailnet doesn't force
-// local updates to lag, and so tailnet peers aren't hammered as often.
+// local updates to lag, and so tailnet peers aren't hammered as often. A
+// third, much slower ticker opportunistically identifies what's actually
+// running on already-discovered services via nmap.
 type Orchestrator struct {
-	cfg     Config
-	docker  *DockerClient
-	tailnet *TailscaleClient
-	prober  *Prober
-	reg     *registry.Registry
-	log     *slog.Logger
+	cfg           Config
+	docker        *DockerClient
+	tailnet       *TailscaleClient
+	prober        *Prober
+	reg           *registry.Registry
+	log           *slog.Logger
+	nmapAvailable bool
 }
 
 func NewOrchestrator(cfg Config, reg *registry.Registry, log *slog.Logger) *Orchestrator {
+	_, nmapErr := exec.LookPath("nmap")
 	return &Orchestrator{
-		cfg:     cfg,
-		docker:  NewDockerClient(cfg.DockerSocket),
-		tailnet: NewTailscaleClient(cfg.TailscaleSocket),
-		prober:  NewProber(cfg.ProbeTimeout),
-		reg:     reg,
-		log:     log,
+		cfg:           cfg,
+		docker:        NewDockerClient(cfg.DockerSocket),
+		tailnet:       NewTailscaleClient(cfg.TailscaleSocket),
+		prober:        NewProber(cfg.ProbeTimeout),
+		reg:           reg,
+		log:           log,
+		nmapAvailable: nmapErr == nil,
 	}
 }
 
 // Run blocks, scanning both sources immediately and then on their own
 // intervals until ctx is done.
 func (o *Orchestrator) Run(ctx context.Context) {
+	if !o.nmapAvailable {
+		o.log.Info("nmap not found; service/version identification disabled")
+	}
 	go o.loop(ctx, o.cfg.Interval, o.dockerPass)
+	go o.loopDelayed(ctx, 2*time.Minute, o.cfg.IdentifyInterval, o.identifyPass)
 	o.loop(ctx, o.cfg.TailnetInterval, o.tailnetPass)
 }
 
 func (o *Orchestrator) loop(ctx context.Context, interval time.Duration, pass func(context.Context)) {
+	pass(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pass(ctx)
+		}
+	}
+}
+
+// loopDelayed is like loop but waits startDelay before its first run, so a
+// pass that depends on other discovery having already populated the
+// registry (e.g. identification) doesn't fire against an empty registry
+// at startup.
+func (o *Orchestrator) loopDelayed(ctx context.Context, startDelay, interval time.Duration, pass func(context.Context)) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(startDelay):
+	}
 	pass(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -75,6 +110,18 @@ type target struct {
 	host   string // display hostname
 	addr   string // dial address
 	port   int
+	docker *DockerContainer
+}
+
+// probedResult is a successful probe awaiting dedup before it's committed
+// to the registry.
+type probedResult struct {
+	id     string
+	source string
+	host   string
+	addr   string
+	port   int
+	res    *ProbeResult
 	docker *DockerContainer
 }
 
@@ -139,16 +186,22 @@ func (o *Orchestrator) dockerPass(ctx context.Context) {
 		seenMu.Unlock()
 	}
 
+	var results []probedResult
+	var resultsMu sync.Mutex
+
 	for _, es := range explicit {
 		id := dockerID(es.host, es.port)
 		if res, ok := o.prober.ProbeScheme(passCtx, es.scheme, es.addr, es.port); ok {
-			o.upsertFromProbe(id, "docker", es.host, es.addr, es.port, res, es.docker)
+			resultsMu.Lock()
+			results = append(results, probedResult{id: id, source: "docker", host: es.host, addr: es.addr, port: es.port, res: res, docker: es.docker})
+			resultsMu.Unlock()
 		} else {
 			// Trust the label even if the probe failed (e.g. odd auth); still
-			// worth showing so the user knows it's configured.
+			// worth showing so the user knows it's configured. Bypasses
+			// dedup entirely since there's no scraped title to compare.
 			o.upsertExplicit(id, es)
+			markSeen(id)
 		}
-		markSeen(id)
 	}
 
 	sem := make(chan struct{}, max(1, o.cfg.Concurrency))
@@ -160,16 +213,22 @@ func (o *Orchestrator) dockerPass(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			id := dockerID(t.host, t.port)
 			res, ok := o.prober.Probe(passCtx, t.addr, t.port)
 			if !ok {
 				return
 			}
-			markSeen(id)
-			o.upsertFromProbe(id, "docker", t.host, t.addr, t.port, res, t.docker)
+			id := dockerID(t.host, t.port)
+			resultsMu.Lock()
+			results = append(results, probedResult{id: id, source: "docker", host: t.host, addr: t.addr, port: t.port, res: res, docker: t.docker})
+			resultsMu.Unlock()
 		}()
 	}
 	wg.Wait()
+
+	for _, r := range dedupeSameService(results) {
+		o.upsertFromProbe(r.id, r.source, r.host, r.addr, r.port, r.res, r.docker)
+		markSeen(r.id)
+	}
 
 	o.reg.MarkOfflineExceptForSource("docker", seen)
 }
@@ -209,8 +268,8 @@ func (o *Orchestrator) tailnetPass(ctx context.Context) {
 		}
 	}
 
-	seen := make(map[string]struct{}, len(targets))
-	var seenMu sync.Mutex
+	var results []probedResult
+	var resultsMu sync.Mutex
 
 	sem := make(chan struct{}, max(1, o.cfg.Concurrency))
 	var wg sync.WaitGroup
@@ -226,15 +285,63 @@ func (o *Orchestrator) tailnetPass(ctx context.Context) {
 				return
 			}
 			id := fmt.Sprintf("%s:%d", t.host, t.port)
-			seenMu.Lock()
-			seen[id] = struct{}{}
-			seenMu.Unlock()
-			o.upsertFromProbe(id, "tailscale", t.host, t.addr, t.port, res, nil)
+			resultsMu.Lock()
+			results = append(results, probedResult{id: id, source: "tailscale", host: t.host, addr: t.addr, port: t.port, res: res})
+			resultsMu.Unlock()
 		}()
 	}
 	wg.Wait()
 
+	deduped := dedupeSameService(results)
+	seen := make(map[string]struct{}, len(deduped))
+	for _, r := range deduped {
+		o.upsertFromProbe(r.id, r.source, r.host, r.addr, r.port, r.res, r.docker)
+		seen[r.id] = struct{}{}
+	}
+
 	o.reg.MarkOfflineExceptForSource("tailscale", seen)
+}
+
+// dedupeSameService drops results that are just a same-host duplicate of
+// another result with an identical scraped title — e.g. the same app
+// answering on both :80 and :443 without one redirecting to the other, which
+// the redirect-stub check in probe.go can't catch since both are genuinely
+// live responses. Results with no scraped title are never deduped, since an
+// empty title isn't a reliable signal that two ports are the same service.
+// Between duplicates, https wins, then the lower port.
+func dedupeSameService(results []probedResult) []probedResult {
+	type key struct{ host, title string }
+	bestIdx := map[key]int{}
+	keyOf := make([]key, len(results))
+	for i, r := range results {
+		title := strings.TrimSpace(r.res.Title)
+		if title == "" {
+			continue // sentinel zero-value key below; never deduped
+		}
+		k := key{host: r.host, title: title}
+		keyOf[i] = k
+		j, ok := bestIdx[k]
+		if !ok || isBetterDuplicate(results[i], results[j]) {
+			bestIdx[k] = i
+		}
+	}
+
+	out := make([]probedResult, 0, len(results))
+	for i, r := range results {
+		k := keyOf[i]
+		if k == (key{}) || bestIdx[k] == i {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func isBetterDuplicate(a, b probedResult) bool {
+	aHTTPS, bHTTPS := a.res.Scheme == "https", b.res.Scheme == "https"
+	if aHTTPS != bHTTPS {
+		return aHTTPS
+	}
+	return a.port < b.port
 }
 
 // dockerID namespaces Docker-sourced IDs so they can never collide with a
@@ -336,4 +443,39 @@ func parseExplicitURL(raw string, c DockerContainer) (explicitService, bool) {
 		scheme: scheme,
 		docker: &c,
 	}, true
+}
+
+// identifyPass opportunistically runs nmap service/version detection against
+// services already confirmed online by the HTTP probes above. It never scans
+// a port range itself — only single, already-known-open ports — and runs on
+// a far slower cadence (IdentifyInterval, default 6h), so it stays cheap
+// regardless of how it's implemented.
+func (o *Orchestrator) identifyPass(ctx context.Context) {
+	if !o.nmapAvailable {
+		return
+	}
+	passCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	services := o.reg.List()
+
+	sem := make(chan struct{}, 5)
+	var wg sync.WaitGroup
+	for _, s := range services {
+		if !s.Online {
+			continue
+		}
+		s := s
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			detected, ok := identifyService(passCtx, s.Address, s.Port)
+			if ok {
+				o.reg.SetDetected(s.ID, detected)
+			}
+		}()
+	}
+	wg.Wait()
 }

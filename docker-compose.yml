@@ -15,10 +15,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock:ro
     environment:
-      - PORT=8080
+      - PORT=8888
       - SITE_TITLE=Home
       - DATA_DIR=/data
       - DISCOVERY_INTERVAL=5s
+      - TAILNET_INTERVAL=30s
       - PROBE_TIMEOUT=1500ms
       - PROBE_CONCURRENCY=40
       - DOCKER_SOCKET=/var/run/docker.sock

@@ -40,6 +40,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))))
+	mux.HandleFunc("GET /sw.js", s.handleServiceWorker)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /api/services", s.handleList)
 	mux.HandleFunc("PATCH /api/services/{id}", s.handleUpdate)
@@ -54,6 +55,19 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if err := s.tmpl.ExecuteTemplate(w, "index.html", data); err != nil {
 		s.log.Error("render index", "err", err)
 	}
+}
+
+// handleServiceWorker serves sw.js from root scope (rather than /static/)
+// so its default registration scope covers the whole app, not just /static/.
+func (s *Server) handleServiceWorker(w http.ResponseWriter, r *http.Request) {
+	b, err := staticFS.ReadFile("static/sw.js")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(b)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {

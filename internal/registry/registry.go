@@ -4,12 +4,25 @@ package registry
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+)
+
+// HistoryEntry records an online/offline transition for a service.
+type HistoryEntry struct {
+	Time   time.Time `json:"time"`
+	Online bool      `json:"online"`
+}
+
+// historyRetention bounds how far back a service's history log reaches.
+// historyMaxEntries is a hard cap for services that flap constantly, so a
+// single noisy service can't grow state.json without bound.
+const (
+	historyRetention  = 7 * 24 * time.Hour
+	historyMaxEntries = 500
 )
 
 // Service is one discovered (or user-added) endpoint.
@@ -32,9 +45,12 @@ type Service struct {
 	CategoryOverride string `json:"categoryOverride,omitempty"`
 	Category         string `json:"category"` // effective category (source-derived default)
 	Hidden           bool   `json:"hidden,omitempty"`
+
+	History []HistoryEntry `json:"history,omitempty"`
 }
 
-// DisplayName returns the user override if set, else the scraped title, else host:port.
+// DisplayName returns the user override if set, else the scraped title, else
+// "Not Found" (no title could be determined, e.g. an untitled or auth-gated page).
 func (s Service) DisplayName() string {
 	if s.NameOverride != "" {
 		return s.NameOverride
@@ -42,7 +58,24 @@ func (s Service) DisplayName() string {
 	if s.Title != "" {
 		return s.Title
 	}
-	return fmt.Sprintf("%s:%d", s.Host, s.Port)
+	return "Not Found"
+}
+
+// appendTransition records an online/offline change and prunes old entries.
+func appendTransition(history []HistoryEntry, online bool) []HistoryEntry {
+	history = append(history, HistoryEntry{Time: time.Now(), Online: online})
+
+	cutoff := time.Now().Add(-historyRetention)
+	start := 0
+	for start < len(history) && history[start].Time.Before(cutoff) {
+		start++
+	}
+	history = history[start:]
+
+	if len(history) > historyMaxEntries {
+		history = history[len(history)-historyMaxEntries:]
+	}
+	return history
 }
 
 // EffectiveCategory returns the user override if set, else the default category.
@@ -121,8 +154,13 @@ func (r *Registry) Upsert(s Service) {
 		s.NameOverride = existing.NameOverride
 		s.CategoryOverride = existing.CategoryOverride
 		s.Hidden = existing.Hidden
+		s.History = existing.History
+		if !existing.Online {
+			s.History = appendTransition(s.History, true)
+		}
 	} else {
 		s.FirstSeen = now
+		s.History = appendTransition(nil, true)
 	}
 	s.LastSeen = now
 	s.Online = true
@@ -133,14 +171,20 @@ func (r *Registry) Upsert(s Service) {
 	r.notify()
 }
 
-// MarkOfflineExcept flips Online=false for any service not present in the
-// given set of IDs seen during the most recent discovery pass.
-func (r *Registry) MarkOfflineExcept(seen map[string]struct{}) {
+// MarkOfflineExceptForSource flips Online=false for any service of the given
+// source not present in the set of IDs seen during that source's most recent
+// discovery pass. Sources are scoped independently since Docker and tailnet
+// discovery now run on different tickers.
+func (r *Registry) MarkOfflineExceptForSource(source string, seen map[string]struct{}) {
 	r.mu.Lock()
 	changed := false
 	for id, s := range r.services {
+		if s.Source != source {
+			continue
+		}
 		if _, ok := seen[id]; !ok && s.Online {
 			s.Online = false
+			s.History = appendTransition(s.History, false)
 			r.services[id] = s
 			changed = true
 		}

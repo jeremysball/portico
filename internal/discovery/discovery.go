@@ -15,7 +15,8 @@ import (
 
 // Config controls the discovery orchestrator.
 type Config struct {
-	Interval        time.Duration // how often to re-scan (default 5s)
+	Interval        time.Duration // how often to rescan local Docker containers (default 5s)
+	TailnetInterval time.Duration // how often to probe tailnet peers (default 30s; each pass fans out Ports x hosts requests, so this runs far less often than Interval)
 	ProbeTimeout    time.Duration // per-request HTTP timeout (default 1.5s)
 	Concurrency     int           // max in-flight probes (default 40)
 	Ports           []int         // common ports to probe on every tailnet host
@@ -24,7 +25,9 @@ type Config struct {
 }
 
 // Orchestrator ties the three discovery sources together and keeps a
-// registry.Registry up to date on a fixed interval.
+// registry.Registry up to date. Docker (cheap, local) and tailnet (expensive,
+// cross-network) run on independent tickers so a large tailnet doesn't force
+// local updates to lag, and so tailnet peers aren't hammered as often.
 type Orchestrator struct {
 	cfg     Config
 	docker  *DockerClient
@@ -45,17 +48,23 @@ func NewOrchestrator(cfg Config, reg *registry.Registry, log *slog.Logger) *Orch
 	}
 }
 
-// Run blocks, scanning immediately and then every cfg.Interval until ctx is done.
+// Run blocks, scanning both sources immediately and then on their own
+// intervals until ctx is done.
 func (o *Orchestrator) Run(ctx context.Context) {
-	o.runOnce(ctx)
-	ticker := time.NewTicker(o.cfg.Interval)
+	go o.loop(ctx, o.cfg.Interval, o.dockerPass)
+	o.loop(ctx, o.cfg.TailnetInterval, o.tailnetPass)
+}
+
+func (o *Orchestrator) loop(ctx context.Context, interval time.Duration, pass func(context.Context)) {
+	pass(ctx)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			o.runOnce(ctx)
+			pass(ctx)
 		}
 	}
 }
@@ -69,73 +78,56 @@ type target struct {
 	docker *DockerContainer
 }
 
-func (o *Orchestrator) runOnce(ctx context.Context) {
-	passCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+// selfHostname resolves this node's display hostname: the tailnet hostname
+// when available (cheap local IPC, not a network probe), else the OS hostname.
+func (o *Orchestrator) selfHostname(ctx context.Context) string {
+	if h, err := os.Hostname(); err == nil {
+		if o.tailnet.Available(ctx) {
+			if th, err := o.tailnet.SelfHostname(ctx); err == nil && th != "" {
+				return th
+			}
+		}
+		return h
+	}
+	return ""
+}
+
+// dockerPass discovers containers running on this host and probes their
+// published ports (or an explicit portico.url label). Docker is always
+// local, so this is cheap and safe to run frequently.
+func (o *Orchestrator) dockerPass(ctx context.Context) {
+	passCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	selfHost := ""
-	if h, err := os.Hostname(); err == nil {
-		selfHost = h
+	if !o.docker.Available(passCtx) {
+		return
 	}
 
-	var tailnetHosts []TailnetHost
-	if o.tailnet.Available(passCtx) {
-		if hosts, err := o.tailnet.Hosts(passCtx); err == nil {
-			tailnetHosts = hosts
-		} else {
-			o.log.Warn("tailscale status failed", "err", err)
-		}
-		if h, err := o.tailnet.SelfHostname(passCtx); err == nil && h != "" {
-			selfHost = h
-		}
+	selfHost := o.selfHostname(passCtx)
+
+	containers, err := o.docker.List(passCtx)
+	if err != nil {
+		o.log.Warn("docker list failed", "err", err)
+		return
 	}
 
+	var explicit []explicitService
 	targets := map[string]*target{}
-	addTarget := func(host, addr string, port int, dc *DockerContainer) {
-		key := fmt.Sprintf("%s|%d", addr, port)
-		if existing, ok := targets[key]; ok {
-			if dc != nil {
-				existing.docker = dc
+	for i := range containers {
+		c := containers[i]
+		if raw := c.ExplicitURL(); raw != "" {
+			if es, ok := parseExplicitURL(raw, c); ok {
+				explicit = append(explicit, es)
 			}
-			return
-		}
-		targets[key] = &target{host: host, addr: addr, port: port, docker: dc}
-	}
-
-	for _, h := range tailnetHosts {
-		if len(h.IPs) == 0 {
 			continue
 		}
-		hostname := h.Hostname
-		addr := h.IPs[0].String()
-		if hostname == "" {
-			hostname = addr
-		}
-		for _, port := range o.cfg.Ports {
-			addTarget(hostname, addr, port, nil)
-		}
-	}
-
-	// Docker containers are always local to this machine; dial them via
-	// localhost (the portico container is expected to run with host
-	// networking so it can reach sibling containers' published ports).
-	var explicit []explicitService
-	if o.docker.Available(passCtx) {
-		containers, err := o.docker.List(passCtx)
-		if err != nil {
-			o.log.Warn("docker list failed", "err", err)
-		}
-		for i := range containers {
-			c := containers[i]
-			if raw := c.ExplicitURL(); raw != "" {
-				if es, ok := parseExplicitURL(raw, c); ok {
-					explicit = append(explicit, es)
-				}
+		for _, port := range c.Ports {
+			key := fmt.Sprintf("%d", port)
+			if existing, ok := targets[key]; ok {
+				existing.docker = &c
 				continue
 			}
-			for _, port := range c.Ports {
-				addTarget(selfHost, "localhost", port, &c)
-			}
+			targets[key] = &target{host: selfHost, addr: "localhost", port: port, docker: &c}
 		}
 	}
 
@@ -148,9 +140,9 @@ func (o *Orchestrator) runOnce(ctx context.Context) {
 	}
 
 	for _, es := range explicit {
-		id := fmt.Sprintf("%s:%d", es.host, es.port)
+		id := dockerID(es.host, es.port)
 		if res, ok := o.prober.ProbeScheme(passCtx, es.scheme, es.addr, es.port); ok {
-			o.upsertFromProbe(id, es.host, es.addr, es.port, res, es.docker)
+			o.upsertFromProbe(id, "docker", es.host, es.addr, es.port, res, es.docker)
 		} else {
 			// Trust the label even if the probe failed (e.g. odd auth); still
 			// worth showing so the user knows it's configured.
@@ -168,21 +160,93 @@ func (o *Orchestrator) runOnce(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			id := fmt.Sprintf("%s:%d", t.host, t.port)
+			id := dockerID(t.host, t.port)
 			res, ok := o.prober.Probe(passCtx, t.addr, t.port)
 			if !ok {
 				return
 			}
 			markSeen(id)
-			o.upsertFromProbe(id, t.host, t.addr, t.port, res, t.docker)
+			o.upsertFromProbe(id, "docker", t.host, t.addr, t.port, res, t.docker)
 		}()
 	}
 	wg.Wait()
 
-	o.reg.MarkOfflineExcept(seen)
+	o.reg.MarkOfflineExceptForSource("docker", seen)
 }
 
-func (o *Orchestrator) upsertFromProbe(id, host, addr string, port int, res *ProbeResult, dc *DockerContainer) {
+// tailnetPass probes every configured port on every online tailnet host,
+// including this one. This is the expensive fan-out (Ports x hosts HTTP
+// requests each pass), so it runs on the slower TailnetInterval.
+func (o *Orchestrator) tailnetPass(ctx context.Context) {
+	passCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	if !o.tailnet.Available(passCtx) {
+		return
+	}
+	hosts, err := o.tailnet.Hosts(passCtx)
+	if err != nil {
+		o.log.Warn("tailscale status failed", "err", err)
+		return
+	}
+
+	targets := map[string]*target{}
+	for _, h := range hosts {
+		if len(h.IPs) == 0 {
+			continue
+		}
+		hostname := h.Hostname
+		addr := h.IPs[0].String()
+		if hostname == "" {
+			hostname = addr
+		}
+		for _, port := range o.cfg.Ports {
+			key := fmt.Sprintf("%s|%d", addr, port)
+			if _, ok := targets[key]; ok {
+				continue
+			}
+			targets[key] = &target{host: hostname, addr: addr, port: port}
+		}
+	}
+
+	seen := make(map[string]struct{}, len(targets))
+	var seenMu sync.Mutex
+
+	sem := make(chan struct{}, max(1, o.cfg.Concurrency))
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		t := t
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, ok := o.prober.Probe(passCtx, t.addr, t.port)
+			if !ok {
+				return
+			}
+			id := fmt.Sprintf("%s:%d", t.host, t.port)
+			seenMu.Lock()
+			seen[id] = struct{}{}
+			seenMu.Unlock()
+			o.upsertFromProbe(id, "tailscale", t.host, t.addr, t.port, res, nil)
+		}()
+	}
+	wg.Wait()
+
+	o.reg.MarkOfflineExceptForSource("tailscale", seen)
+}
+
+// dockerID namespaces Docker-sourced IDs so they can never collide with a
+// tailnet-sourced entry for the same host:port — notably when this machine's
+// own tailnet hostname (self) is scanned alongside its own Docker containers.
+// Without this, two goroutines could race to upsert the same registry key
+// from two different services, flipping the displayed title pass to pass.
+func dockerID(host string, port int) string {
+	return fmt.Sprintf("docker:%s:%d", host, port)
+}
+
+func (o *Orchestrator) upsertFromProbe(id, source, host, addr string, port int, res *ProbeResult, dc *DockerContainer) {
 	svc := registry.Service{
 		ID:       id,
 		Host:     host,
@@ -192,11 +256,10 @@ func (o *Orchestrator) upsertFromProbe(id, host, addr string, port int, res *Pro
 		URL:      fmt.Sprintf("%s://%s:%d/", res.Scheme, host, port),
 		Title:    res.Title,
 		Icon:     res.Icon,
-		Source:   "tailscale",
+		Source:   source,
 		Category: host,
 	}
 	if dc != nil {
-		svc.Source = "docker"
 		if dc.NameOverride() != "" {
 			svc.Title = dc.NameOverride()
 		} else if dc.Name != "" && svc.Title == "" {
@@ -227,10 +290,10 @@ func (o *Orchestrator) upsertExplicit(id string, es explicitService) {
 		Address:  es.addr,
 		Port:     es.port,
 		Scheme:   es.scheme,
-		URL:      fmt.Sprintf("%s://%s:%d/", es.scheme, es.host, es.port),
 		Source:   "docker",
 		Category: es.host,
 	}
+	svc.URL = fmt.Sprintf("%s://%s:%d/", es.scheme, es.host, es.port)
 	if es.docker != nil {
 		if es.docker.NameOverride() != "" {
 			svc.Title = es.docker.NameOverride()

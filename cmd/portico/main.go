@@ -41,6 +41,7 @@ func main() {
 
 	discCfg := discovery.Config{
 		Interval:        getEnvDuration("DISCOVERY_INTERVAL", 5*time.Second),
+		TailnetInterval: getEnvDuration("TAILNET_INTERVAL", 30*time.Second),
 		ProbeTimeout:    getEnvDuration("PROBE_TIMEOUT", 1500*time.Millisecond),
 		Concurrency:     getEnvInt("PROBE_CONCURRENCY", 40),
 		Ports:           getEnvPorts("PORTS", defaultPorts),

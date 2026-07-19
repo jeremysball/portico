@@ -81,9 +81,14 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 
+	// Only trust the scraped title on success responses — error/auth pages
+	// (401/403/404...) often carry a generic <title> ("Not Found",
+	// "Unauthorized") that would otherwise get shown as the service's name.
 	title := ""
-	if m := titleRe.FindSubmatch(body); m != nil {
-		title = strings.Join(strings.Fields(html.UnescapeString(string(m[1]))), " ")
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if m := titleRe.FindSubmatch(body); m != nil {
+			title = strings.Join(strings.Fields(html.UnescapeString(string(m[1]))), " ")
+		}
 	}
 
 	icon := extractIcon(base, body)

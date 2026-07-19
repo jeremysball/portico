@@ -47,6 +47,11 @@ type Service struct {
 	Hidden           bool   `json:"hidden,omitempty"`
 
 	History []HistoryEntry `json:"history,omitempty"`
+
+	// Detected is an nmap-derived "product version" or generic service name
+	// (e.g. "nginx 1.24.0"), set by the separate, much slower identify pass.
+	// Preserved across the frequent Upsert cycle like the other overrides.
+	Detected string `json:"detected,omitempty"`
 }
 
 // DisplayName returns the user override if set, else the scraped title, else
@@ -155,6 +160,7 @@ func (r *Registry) Upsert(s Service) {
 		s.CategoryOverride = existing.CategoryOverride
 		s.Hidden = existing.Hidden
 		s.History = existing.History
+		s.Detected = existing.Detected
 		if !existing.Online {
 			s.History = appendTransition(s.History, true)
 		}
@@ -165,6 +171,26 @@ func (r *Registry) Upsert(s Service) {
 	s.LastSeen = now
 	s.Online = true
 	r.services[s.ID] = s
+	r.mu.Unlock()
+
+	r.save()
+	r.notify()
+}
+
+// SetDetected records an nmap-derived service/version string for an
+// already-known service without disturbing its online status, history, or
+// user customizations. A no-op if the service is gone or already carries
+// this exact value, so the identify pass doesn't spam saves/notifies when
+// nothing changed.
+func (r *Registry) SetDetected(id, detected string) {
+	r.mu.Lock()
+	s, ok := r.services[id]
+	if !ok || s.Detected == detected {
+		r.mu.Unlock()
+		return
+	}
+	s.Detected = detected
+	r.services[id] = s
 	r.mu.Unlock()
 
 	r.save()

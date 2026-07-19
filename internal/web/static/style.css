@@ -234,6 +234,17 @@ section h2 {
   color: var(--text-dim);
 }
 
+.tile .detected {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  opacity: 0.75;
+  font-style: italic;
+}
+
+.tile .detected[hidden] {
+  display: none;
+}
+
 .tile .edit-btn,
 .tile .history-btn {
   position: absolute;

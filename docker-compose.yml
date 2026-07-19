@@ -4,6 +4,11 @@ services:
     # Uncomment to build from source instead of pulling the published image:
     # build: .
     container_name: portico
+    pull_policy: always
+    labels:
+      # Watchtower below only touches containers carrying this scope, so it never restarts
+      # unrelated containers sharing this host's docker socket.
+      - "com.centurylinklabs.watchtower.scope=portico"
     restart: unless-stopped
     # Host networking lets the dashboard reach both sibling containers'
     # published ports (via localhost) and tailnet peers' 100.x IPs directly,
@@ -26,3 +31,16 @@ services:
       - DOCKER_SOCKET=/var/run/docker.sock
       - TAILSCALE_SOCKET=/var/run/tailscale/tailscaled.sock
       # - PORTS=80,443,3000,8080,8096,8123
+
+  # Pulls the image release.yml publishes to ghcr.io on every merge to main and restarts
+  # portico onto it, so deploying is "merge to main" rather than "SSH in and rebuild".
+  watchtower:
+    image: nickfedor/watchtower:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=60
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_SCOPE=portico
+    restart: unless-stopped

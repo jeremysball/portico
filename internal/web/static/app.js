@@ -65,7 +65,7 @@ function buildTile() {
   edit.title = "Rename / recategorize / hide";
   a.appendChild(edit);
 
-  return { el: a, icon, name, meta, history, edit };
+  return { el: a, icon, name, meta, detected, history, edit };
 }
 
 function updateTile(tile, s) {

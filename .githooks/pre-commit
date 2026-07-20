@@ -1,0 +1,45 @@
+#!/bin/sh
+# Fast local gate: gofmt + go vet + golangci-lint on staged Go files only.
+# The full test suite runs in CI, not here — keep this hook fast enough
+# that nobody reaches for --no-verify.
+#
+# Bypass: git commit --no-verify
+
+staged_go_files=$(git diff --cached --name-only --diff-filter=ACM -- '*.go')
+
+if [ -z "$staged_go_files" ]; then
+    exit 0
+fi
+
+fail=0
+
+fmt_out=$(printf '%s\n' "$staged_go_files" | xargs gofmt -l 2>/dev/null)
+if [ -n "$fmt_out" ]; then
+    echo "gofmt: not formatted:"
+    echo "$fmt_out"
+    fail=1
+fi
+
+if ! go vet ./... >/tmp/portico-vet.$$ 2>&1; then
+    echo "go vet failed:"
+    cat /tmp/portico-vet.$$
+    fail=1
+fi
+rm -f /tmp/portico-vet.$$
+
+if command -v golangci-lint >/dev/null 2>&1; then
+    if ! golangci-lint run --new-from-rev=HEAD ./... >/tmp/portico-lint.$$ 2>&1; then
+        echo "golangci-lint (warning, not blocking):"
+        cat /tmp/portico-lint.$$
+    fi
+    rm -f /tmp/portico-lint.$$
+else
+    echo "golangci-lint not installed locally — skipping (CI still enforces it)"
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "Pre-commit checks failed. Fix the above, or bypass with --no-verify."
+    exit 1
+fi
+
+exit 0

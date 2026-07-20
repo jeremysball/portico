@@ -2,6 +2,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -20,16 +21,23 @@ var templatesFS embed.FS
 //go:embed static/*
 var staticFS embed.FS
 
-type Server struct {
-	reg   *registry.Registry
-	log   *slog.Logger
-	tmpl  *template.Template
-	title string
+// hostSweeper is the subset of discovery.Orchestrator the web layer needs to
+// trigger an on-demand full-port sweep of one tailnet host.
+type hostSweeper interface {
+	SweepHost(ctx context.Context, host string) error
 }
 
-func New(reg *registry.Registry, log *slog.Logger, siteTitle string) *Server {
+type Server struct {
+	reg     *registry.Registry
+	log     *slog.Logger
+	tmpl    *template.Template
+	title   string
+	sweeper hostSweeper
+}
+
+func New(reg *registry.Registry, log *slog.Logger, siteTitle string, sweeper hostSweeper) *Server {
 	tmpl := template.Must(template.ParseFS(templatesFS, "templates/*.html"))
-	return &Server{reg: reg, log: log, tmpl: tmpl, title: siteTitle}
+	return &Server{reg: reg, log: log, tmpl: tmpl, title: siteTitle, sweeper: sweeper}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -45,6 +53,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/services", s.handleList)
 	mux.HandleFunc("PATCH /api/services/{id}", s.handleUpdate)
 	mux.HandleFunc("DELETE /api/services/{id}", s.handleDelete)
+	mux.HandleFunc("POST /api/hosts/{host}/refresh", s.handleRefreshHost)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	return mux
 }
@@ -96,6 +105,20 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s.reg.Delete(r.PathValue("id"))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRefreshHost triggers an immediate full-port sweep of a single
+// tailnet host, for a user who knows a service just came up there and
+// doesn't want to wait for the next scheduled sweep. Docker-sourced hosts
+// have nothing to sweep (Docker discovery already runs every few seconds),
+// so this always targets tailnet.
+func (s *Server) handleRefreshHost(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	if err := s.sweeper.SweepHost(r.Context(), host); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

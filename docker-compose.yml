@@ -25,6 +25,7 @@ services:
       - DATA_DIR=/data
       - DISCOVERY_INTERVAL=5s
       - TAILNET_INTERVAL=30s
+      # - TAILNET_SWEEP_INTERVAL=6h
       - IDENTIFY_INTERVAL=6h
       - PROBE_TIMEOUT=1500ms
       - PROBE_CONCURRENCY=40

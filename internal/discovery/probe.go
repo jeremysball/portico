@@ -78,7 +78,7 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 	if err != nil {
 		return nil, false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// A response that landed (after following redirects) on the *same* host
 	// but a *different* port is just a redirect stub — e.g. :80 bouncing to
@@ -96,6 +96,16 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+
+	// A plaintext GET against a TLS listener doesn't fail the connection —
+	// Go's net/http server (and several others, e.g. nginx's default TLS
+	// vhost) answers with a well-formed plaintext 400 whose body says so.
+	// That looks like a legitimate "up" response and would otherwise get
+	// recorded as scheme=http, permanently masking the real https service.
+	if scheme == "http" && resp.StatusCode == http.StatusBadRequest &&
+		strings.Contains(string(body), "Client sent an HTTP request to an HTTPS server") {
+		return nil, false
+	}
 
 	// Only trust the scraped title on success responses — error/auth pages
 	// (401/403/404...) often carry a generic <title> ("Not Found",
@@ -160,7 +170,7 @@ func (p *Prober) probeDefaultFavicon(ctx context.Context, scheme, addr string, p
 	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return url
 	}

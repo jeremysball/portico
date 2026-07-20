@@ -29,7 +29,7 @@ func TestProbe_FallsBackToHTTPSOnNonStandardPort(t *testing.T) {
 	}
 
 	p := NewProber(2 * time.Second)
-	res, ok := p.Probe(context.Background(), addr, port)
+	res, ok := p.Probe(context.Background(), "", addr, port)
 	if !ok {
 		t.Fatal("expected probe to succeed")
 	}

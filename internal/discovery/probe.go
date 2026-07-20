@@ -15,16 +15,12 @@ import (
 	"time"
 )
 
-var (
-	titleRe    = regexp.MustCompile(`(?is)<title[^>]*>\s*(.*?)\s*</title>`)
-	iconLinkRe = regexp.MustCompile(`(?is)<link[^>]+rel=["']?(?:shortcut icon|icon|apple-touch-icon)["']?[^>]*href=["']([^"'>]+)["']`)
-)
+var titleRe = regexp.MustCompile(`(?is)<title[^>]*>\s*(.*?)\s*</title>`)
 
 // ProbeResult describes a live HTTP(S) endpoint found at a given address/port.
 type ProbeResult struct {
 	Scheme string
 	Title  string
-	Icon   string // absolute URL, empty if none could be found
 }
 
 // Prober performs lightweight HTTP(S) liveness checks against host:port pairs.
@@ -32,13 +28,26 @@ type Prober struct {
 	client *http.Client
 }
 
+// dialAddrKey carries the real dial target (IP or "localhost") through a
+// request's context, so the request URL can use the display/DNS hostname
+// (for correct TLS SNI and Host header) while the TCP connection still goes
+// to the address the caller actually resolved, rather than depending on that
+// hostname resolving via DNS itself.
+type dialAddrKey struct{}
+
 func NewProber(timeout time.Duration) *Prober {
+	dialer := &net.Dialer{Timeout: timeout}
 	return &Prober{
 		client: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-				DialContext:     (&net.Dialer{Timeout: timeout}).DialContext,
+				DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+					if override, ok := ctx.Value(dialAddrKey{}).(string); ok && override != "" {
+						address = override
+					}
+					return dialer.DialContext(ctx, network, address)
+				},
 			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 5 {
@@ -50,16 +59,19 @@ func NewProber(timeout time.Duration) *Prober {
 	}
 }
 
-// Probe checks whether an HTTP(S) service is listening at addr:port. Any
-// response at all (including 401/403/redirects) counts as "up" — plenty of
-// self-hosted dashboards require auth on "/".
-func (p *Prober) Probe(ctx context.Context, addr string, port int) (*ProbeResult, bool) {
+// Probe checks whether an HTTP(S) service is listening at addr:port. host is
+// the display/DNS hostname used to build the request URL — and therefore the
+// TLS SNI and Host header — so the probe sees the same virtual host a real
+// browser visiting that hostname would; pass "" when no better hostname than
+// addr is known. Any response at all (including 401/403/redirects) counts as
+// "up" — plenty of self-hosted dashboards require auth on "/".
+func (p *Prober) Probe(ctx context.Context, host, addr string, port int) (*ProbeResult, bool) {
 	schemes := []string{"http", "https"}
 	if port == 443 || port == 8443 || port == 9443 {
 		schemes = []string{"https", "http"}
 	}
 	for _, scheme := range schemes {
-		if res, ok := p.ProbeScheme(ctx, scheme, addr, port); ok {
+		if res, ok := p.ProbeScheme(ctx, scheme, host, addr, port); ok {
 			return res, true
 		}
 	}
@@ -68,12 +80,16 @@ func (p *Prober) Probe(ctx context.Context, addr string, port int) (*ProbeResult
 
 // ProbeScheme checks a single explicit scheme (used when a caller already
 // knows which one applies, e.g. a docker label declaring "https://...").
-func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int) (*ProbeResult, bool) {
-	base := fmt.Sprintf("%s://%s:%d/", scheme, addr, port)
+func (p *Prober) ProbeScheme(ctx context.Context, scheme, host, addr string, port int) (*ProbeResult, bool) {
+	if host == "" {
+		host = addr
+	}
+	base := fmt.Sprintf("%s://%s:%d/", scheme, host, port)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base, nil)
 	if err != nil {
 		return nil, false
 	}
+	req = req.WithContext(context.WithValue(req.Context(), dialAddrKey{}, fmt.Sprintf("%s:%d", addr, port)))
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, false
@@ -90,9 +106,17 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 	// imperfect heuristic in either direction.
 	if resp.Request != nil && resp.Request.URL != nil {
 		gotHost, gotPort := hostPort(resp.Request.URL)
-		if gotHost == addr && gotPort != port {
+		if gotHost == host && gotPort != port {
 			return nil, false
 		}
+	}
+
+	// 404 and 502 mean there's clearly nothing real behind this port — a
+	// catch-all vhost or a reverse proxy with no live backend, not an actual
+	// service. Everything else (including 401/403 — plenty of self-hosted
+	// dashboards require auth on "/") still counts as "up".
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadGateway {
+		return nil, false
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
@@ -117,12 +141,7 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 		}
 	}
 
-	icon := extractIcon(base, body)
-	if icon == "" {
-		icon = p.probeDefaultFavicon(ctx, scheme, addr, port)
-	}
-
-	return &ProbeResult{Scheme: scheme, Title: title, Icon: icon}, true
+	return &ProbeResult{Scheme: scheme, Title: title}, true
 }
 
 // hostPort splits a URL into hostname and effective port, filling in the
@@ -139,40 +158,4 @@ func hostPort(u *neturl.URL) (string, int) {
 		return h, 443
 	}
 	return h, 80
-}
-
-func extractIcon(baseURL string, body []byte) string {
-	m := iconLinkRe.FindSubmatch(body)
-	if m == nil {
-		return ""
-	}
-	href := strings.TrimSpace(string(m[1]))
-	rel, err := neturl.Parse(href)
-	if err != nil {
-		return ""
-	}
-	base, err := neturl.Parse(baseURL)
-	if err != nil {
-		return ""
-	}
-	return base.ResolveReference(rel).String()
-}
-
-// probeDefaultFavicon does a quick existence check for /favicon.ico so the UI
-// doesn't render a broken-image icon when no <link rel="icon"> was declared.
-func (p *Prober) probeDefaultFavicon(ctx context.Context, scheme, addr string, port int) string {
-	url := fmt.Sprintf("%s://%s:%d/favicon.ico", scheme, addr, port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-	if err != nil {
-		return ""
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return url
-	}
-	return ""
 }

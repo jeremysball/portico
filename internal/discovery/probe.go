@@ -97,6 +97,16 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 
+	// A plaintext GET against a TLS listener doesn't fail the connection —
+	// Go's net/http server (and several others, e.g. nginx's default TLS
+	// vhost) answers with a well-formed plaintext 400 whose body says so.
+	// That looks like a legitimate "up" response and would otherwise get
+	// recorded as scheme=http, permanently masking the real https service.
+	if scheme == "http" && resp.StatusCode == http.StatusBadRequest &&
+		strings.Contains(string(body), "Client sent an HTTP request to an HTTPS server") {
+		return nil, false
+	}
+
 	// Only trust the scraped title on success responses — error/auth pages
 	// (401/403/404...) often carry a generic <title> ("Not Found",
 	// "Unauthorized") that would otherwise get shown as the service's name.

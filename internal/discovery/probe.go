@@ -78,7 +78,7 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, addr string, port int)
 	if err != nil {
 		return nil, false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// A response that landed (after following redirects) on the *same* host
 	// but a *different* port is just a redirect stub — e.g. :80 bouncing to
@@ -170,7 +170,7 @@ func (p *Prober) probeDefaultFavicon(ctx context.Context, scheme, addr string, p
 	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return url
 	}

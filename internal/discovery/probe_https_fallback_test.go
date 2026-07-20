@@ -17,7 +17,7 @@ import (
 // server."), which used to get accepted as a live http service.
 func TestProbe_FallsBackToHTTPSOnNonStandardPort(t *testing.T) {
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("<title>Secret TLS Service</title>"))
+		_, _ = w.Write([]byte("<title>Secret TLS Service</title>"))
 	}))
 	defer ts.Close()
 

@@ -146,7 +146,7 @@ func (r *Registry) save() {
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return
 	}
-	os.Rename(tmp, r.path)
+	_ = os.Rename(tmp, r.path)
 }
 
 // Upsert merges a freshly-discovered service into the registry, preserving

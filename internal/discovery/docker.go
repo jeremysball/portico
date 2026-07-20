@@ -55,7 +55,7 @@ func (c *DockerClient) Available(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode == http.StatusOK
 }
 
@@ -79,7 +79,7 @@ func (c *DockerClient) List(ctx context.Context) ([]DockerContainer, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

@@ -94,7 +94,7 @@ func (p *Prober) ProbeScheme(ctx context.Context, scheme, host, addr string, por
 	if err != nil {
 		return nil, false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// A response that landed (after following redirects) on the *same* host
 	// but a *different* port is just a redirect stub — e.g. :80 bouncing to
@@ -159,4 +159,3 @@ func hostPort(u *neturl.URL) (string, int) {
 	}
 	return h, 80
 }
-

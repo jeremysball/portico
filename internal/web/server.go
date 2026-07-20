@@ -76,7 +76,7 @@ func (s *Server) handleServiceWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Write(b)
+	_, _ = w.Write(b)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -136,7 +136,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ch, cancel := s.reg.Subscribe()
 	defer cancel()
 
-	fmt.Fprintf(w, "event: update\ndata: {}\n\n")
+	_, _ = fmt.Fprintf(w, "event: update\ndata: {}\n\n")
 	flusher.Flush()
 
 	keepalive := time.NewTicker(15 * time.Second)
@@ -148,10 +148,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-ch:
-			fmt.Fprintf(w, "event: update\ndata: {}\n\n")
+			_, _ = fmt.Fprintf(w, "event: update\ndata: {}\n\n")
 			flusher.Flush()
 		case <-keepalive.C:
-			fmt.Fprintf(w, ": keepalive\n\n")
+			_, _ = fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()
 		}
 	}

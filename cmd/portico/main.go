@@ -46,6 +46,10 @@ func main() {
 		ProbeTimeout:     getEnvDuration("PROBE_TIMEOUT", 1500*time.Millisecond),
 		Concurrency:      getEnvInt("PROBE_CONCURRENCY", 40),
 		Ports:            getEnvPorts("PORTS", defaultPorts),
+		SSHEnabled:       getEnv("SSH_ENABLED", "false") == "true",
+		SSHInterval:      getEnvDuration("SSH_INTERVAL", 5*time.Minute),
+		SSHTimeout:       getEnvDuration("SSH_TIMEOUT", 15*time.Second),
+		SSHConcurrency:   getEnvInt("SSH_CONCURRENCY", 3),
 		DockerSocket:     getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
 		TailscaleSocket:  getEnv("TAILSCALE_SOCKET", "/var/run/tailscale/tailscaled.sock"),
 	}

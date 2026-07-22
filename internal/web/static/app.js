@@ -107,23 +107,17 @@ function buildTile() {
   }
   a.appendChild(uptime);
 
-  const history = document.createElement("button");
-  history.className = "history-btn";
-  history.textContent = "\u{1F550}";
-  history.title = "View history";
-  a.appendChild(history);
-
   const edit = document.createElement("button");
   edit.className = "edit-btn";
   edit.textContent = "⋯";
   edit.title = "Rename / recategorize / hide";
   a.appendChild(edit);
 
-  return { el: a, icon, name, meta, detected, uptime, uptimeBars, history, edit };
+  return { el: a, icon, name, meta, detected, uptime, uptimeBars, edit };
 }
 
 function updateTile(tile, s) {
-  const { el, icon, name, meta, detected, uptime, uptimeBars, history, edit } = tile;
+  const { el, icon, name, meta, detected, uptime, uptimeBars, edit } = tile;
 
   const wantOffline = !s.online;
   el.classList.toggle("offline", wantOffline);
@@ -168,11 +162,6 @@ function updateTile(tile, s) {
   });
 
   // Rebind each render so the handlers always close over the latest service.
-  history.onclick = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    showHistory(s);
-  };
   edit.onclick = (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -263,19 +252,6 @@ function render(services) {
       tileEls.delete(id);
     }
   }
-}
-
-function showHistory(s) {
-  const dn = displayName(s);
-  if (!s.history || s.history.length === 0) {
-    alert(`${dn}\n\nNo history recorded yet.`);
-    return;
-  }
-  const lines = s.history
-    .slice()
-    .reverse()
-    .map((h) => `${new Date(h.time).toLocaleString()} — ${h.online ? "online" : "offline"}`);
-  alert(`${dn} — history (last 7 days)\n\n${lines.join("\n")}`);
 }
 
 async function openEditor(s) {

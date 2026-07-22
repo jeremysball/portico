@@ -1,3 +1,11 @@
 /data/
 /portico
 *.tmp
+
+.superpowers/*
+!.superpowers/plans/
+!.superpowers/specs/
+!.superpowers/.completed/
+
+/.lavish/
+/*.png

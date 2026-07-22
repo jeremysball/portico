@@ -100,6 +100,11 @@ All via environment variables, all optional:
 | `PORTS` | see `cmd/portico/main.go` | Comma-separated list of ports to probe on every tailnet host |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker Engine API socket |
 | `TAILSCALE_SOCKET` | `/var/run/tailscale/tailscaled.sock` | tailscaled local API socket |
+| `SSH_ENABLED` | `false` | SSH into online tailnet peers to discover listening ports and Docker containers, in addition to port-probing |
+| `SSH_USER` | `root` | SSH username for tailnet connections; set to a non-root account if your Tailscale SSH policy requires one |
+| `SSH_INTERVAL` | `5m` | How often to run the SSH discovery pass |
+| `SSH_TIMEOUT` | `15s` | Per-host dial + handshake + command timeout |
+| `SSH_CONCURRENCY` | `3` | Max hosts SSH'd into concurrently |
 
 ## How it decides what's "online"
 

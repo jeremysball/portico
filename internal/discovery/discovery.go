@@ -26,6 +26,7 @@ type Config struct {
 	DockerSocket     string
 	TailscaleSocket  string
 	SSHEnabled       bool          // SSH_ENABLED env (default false)
+	SSHUser          string        // SSH_USER env (default "root"); many Tailscale SSH policies only permit non-root users
 	SSHInterval      time.Duration // SSH_INTERVAL env (default 5m)
 	SSHTimeout       time.Duration // SSH_TIMEOUT env, per-host dial+command (default 15s)
 	SSHConcurrency   int           // SSH_CONCURRENCY env (default 3)
@@ -42,7 +43,7 @@ type Orchestrator struct {
 	dockerProbe   *DockerProbe
 	tailnet       *TailscaleClient
 	prober        *Prober
-	sshProbe      *SSHProbe       // nil when SSHEnabled=false
+	sshProbe      *SSHProbe // nil when SSHEnabled=false
 	reg           *registry.Registry
 	log           *slog.Logger
 	nmapAvailable bool
@@ -65,7 +66,7 @@ func NewOrchestrator(cfg Config, reg *registry.Registry, log *slog.Logger) *Orch
 	}
 
 	if cfg.SSHEnabled {
-		o.sshProbe = NewSSHProbe(dockerProbe, cfg.SSHTimeout, cfg.SSHConcurrency, log)
+		o.sshProbe = NewSSHProbe(dockerProbe, cfg.SSHUser, cfg.SSHTimeout, cfg.SSHConcurrency, log)
 	}
 
 	return o
@@ -521,8 +522,9 @@ func (o *Orchestrator) sshPass(ctx context.Context) {
 		return
 	}
 
-	hostSem := make(chan struct{}, o.cfg.SSHConcurrency)
+	hostSem := make(chan struct{}, max(1, o.cfg.SSHConcurrency))
 	var allTargets []target
+	var failedHosts []string
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -537,13 +539,14 @@ func (o *Orchestrator) sshPass(ctx context.Context) {
 			defer wg.Done()
 			defer func() { <-hostSem }()
 			targets, err := o.sshProbe.ProbeHost(passCtx, h)
+			mu.Lock()
+			defer mu.Unlock()
 			if err != nil {
 				o.log.Debug("ssh probe failed", "host", h.Hostname, "err", err)
+				failedHosts = append(failedHosts, h.Hostname)
 				return
 			}
-			mu.Lock()
 			allTargets = append(allTargets, targets...)
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
@@ -553,6 +556,24 @@ func (o *Orchestrator) sshPass(ctx context.Context) {
 	for _, r := range probed {
 		o.upsertFromProbe(r.id, r.source, r.host, r.addr, r.port, r.res, r.docker)
 		seen[r.id] = struct{}{}
+	}
+	// A host whose SSH probe failed this pass contributed nothing to `seen`;
+	// without this, MarkOfflineExceptForSource would wrongly flip its
+	// previously-discovered services offline on a merely transient failure.
+	// Preserve them by treating their prior IDs as still seen.
+	if len(failedHosts) > 0 {
+		failed := make(map[string]struct{}, len(failedHosts))
+		for _, h := range failedHosts {
+			failed[h] = struct{}{}
+		}
+		for _, s := range o.reg.List() {
+			if s.Source != "tailscale-ssh" {
+				continue
+			}
+			if _, ok := failed[s.Host]; ok {
+				seen[s.ID] = struct{}{}
+			}
+		}
 	}
 	o.reg.MarkOfflineExceptForSource("tailscale-ssh", seen)
 }

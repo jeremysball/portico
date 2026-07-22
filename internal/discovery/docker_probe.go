@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -21,6 +22,13 @@ func (p *DockerProbe) Local(ctx context.Context) ([]DockerContainer, error) {
 	return p.client.List(ctx)
 }
 
+// parseRemoteContainers parses one JSON object per line, in the shape the
+// docker CLI (not the Engine API) emits for `--format '{{json .}}'`: Names,
+// Labels, and Ports are all pre-formatted strings, e.g.
+// Names="nginx", Labels="portico.name=Web,portico.enable=false",
+// Ports="0.0.0.0:8080->80/tcp, :::8080->80/tcp". This differs from the
+// Engine API's /containers/json shape (structured Names []string, Labels
+// map[string]string, Ports []struct) that DockerClient.List parses locally.
 func parseRemoteContainers(output []byte) ([]DockerContainer, error) {
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	out := make([]DockerContainer, 0, len(lines))
@@ -30,43 +38,80 @@ func parseRemoteContainers(output []byte) ([]DockerContainer, error) {
 			continue
 		}
 		var rc struct {
-			Names  []string          `json:"Names"`
-			Labels map[string]string `json:"Labels"`
-			Ports  []struct {
-				PublicPort uint16 `json:"PublicPort"`
-				Type       string `json:"Type"`
-			} `json:"Ports"`
+			Names  string `json:"Names"`
+			Labels string `json:"Labels"`
+			Ports  string `json:"Ports"`
 		}
 		if err := json.Unmarshal([]byte(line), &rc); err != nil {
 			continue
 		}
-		if strings.EqualFold(rc.Labels[labelPrefix+"enable"], "false") {
+		labels := parseDockerLabelsField(rc.Labels)
+		if strings.EqualFold(labels[labelPrefix+"enable"], "false") {
 			continue
 		}
-		name := ""
-		if len(rc.Names) > 0 {
-			name = strings.TrimPrefix(rc.Names[0], "/")
-		}
-		ports := make([]int, 0, len(rc.Ports))
-		seen := make(map[int]bool)
-		for _, p := range rc.Ports {
-			if p.Type != "tcp" || p.PublicPort == 0 {
-				continue
-			}
-			port := int(p.PublicPort)
-			if !seen[port] {
-				seen[port] = true
-				ports = append(ports, port)
-			}
-		}
-		out = append(out, DockerContainer{Name: name, Labels: rc.Labels, Ports: ports})
+		name := strings.TrimSpace(strings.SplitN(rc.Names, ",", 2)[0])
+		out = append(out, DockerContainer{Name: name, Labels: labels, Ports: parseDockerPortsField(rc.Ports)})
 	}
 	return out, nil
 }
 
+// parseDockerLabelsField parses the CLI's comma-separated "k=v,k=v" labels
+// column into a map.
+func parseDockerLabelsField(s string) map[string]string {
+	labels := make(map[string]string)
+	if s == "" {
+		return labels
+	}
+	for _, kv := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		labels[strings.TrimSpace(k)] = v
+	}
+	return labels
+}
+
+// parseDockerPortsField extracts host-published TCP ports from the CLI's
+// "Ports" column, e.g. "0.0.0.0:8080->80/tcp, :::8080->80/tcp". Entries with
+// no "->" are exposed-but-unpublished and unreachable; entries bound only to
+// loopback (127.0.0.1, ::1) aren't reachable over the tailnet either, mirroring
+// parseSSOutput's loopback skip.
+func parseDockerPortsField(s string) []int {
+	if s == "" {
+		return nil
+	}
+	var ports []int
+	seen := make(map[int]bool)
+	for _, seg := range strings.Split(s, ",") {
+		seg = strings.TrimSpace(seg)
+		hostPart, containerPart, ok := strings.Cut(seg, "->")
+		if !ok {
+			continue
+		}
+		if !strings.HasSuffix(containerPart, "/tcp") {
+			continue
+		}
+		idx := strings.LastIndex(hostPart, ":")
+		if idx < 0 {
+			continue
+		}
+		hostIP := strings.Trim(hostPart[:idx], "[]")
+		if hostIP == "127.0.0.1" || hostIP == "::1" {
+			continue
+		}
+		port, err := strconv.Atoi(hostPart[idx+1:])
+		if err != nil || port == 0 || seen[port] {
+			continue
+		}
+		seen[port] = true
+		ports = append(ports, port)
+	}
+	return ports
+}
+
 // ParseRemote parses the raw stdout of: docker ps --format '{{json .}}'
-// from a remote host. The JSON structure matches the Docker Engine API
-// container list response, same as what DockerClient.List() parses.
+// from a remote host.
 func (p *DockerProbe) ParseRemote(output []byte) ([]DockerContainer, error) {
 	return parseRemoteContainers(output)
 }

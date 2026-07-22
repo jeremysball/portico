@@ -12,9 +12,10 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// SSHPUser is the SSH username for tailnet connections.
-// Tailscale SSH authenticates via node key, not this value — it just satisfies
-// the SSH protocol's user field.
+// SSHPUser is the default SSH username for tailnet connections, overridable
+// via the SSH_USER env var. Tailscale SSH policies commonly restrict which
+// destination OS users are allowed, and many permit only non-root accounts,
+// so this must be configurable rather than hardcoded.
 const SSHPUser = "root"
 
 // SSHProbe discovers services on remote tailnet peers by SSHing in and
@@ -22,14 +23,19 @@ const SSHPUser = "root"
 // It composes DockerProbe.ParseRemote to avoid duplicating docker ps parsing.
 type SSHProbe struct {
 	docker      *DockerProbe
+	user        string
 	timeout     time.Duration
 	concurrency int
 	log         *slog.Logger
 }
 
-func NewSSHProbe(docker *DockerProbe, timeout time.Duration, concurrency int, log *slog.Logger) *SSHProbe {
+func NewSSHProbe(docker *DockerProbe, user string, timeout time.Duration, concurrency int, log *slog.Logger) *SSHProbe {
+	if user == "" {
+		user = SSHPUser
+	}
 	return &SSHProbe{
 		docker:      docker,
+		user:        user,
 		timeout:     timeout,
 		concurrency: concurrency,
 		log:         log,
@@ -47,7 +53,7 @@ func (p *SSHProbe) ProbeHost(ctx context.Context, host TailnetHost) ([]target, e
 	addr := net.JoinHostPort(host.IPs[0].String(), "22")
 
 	config := &ssh.ClientConfig{
-		User: SSHPUser,
+		User: p.user,
 		Auth: []ssh.AuthMethod{
 			ssh.PasswordCallback(func() (string, error) { return "", nil }),
 		},
@@ -64,11 +70,19 @@ func (p *SSHProbe) ProbeHost(ctx context.Context, host TailnetHost) ([]target, e
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
 
+	// ClientConfig.Timeout only bounds Dial's internal net.DialTimeout; it
+	// does not apply to NewClientConn's handshake on an already-open conn,
+	// so a stalling peer would otherwise hang here indefinitely.
+	if err := conn.SetDeadline(time.Now().Add(p.timeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("set handshake deadline %s: %w", addr, err)
+	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ssh handshake %s: %w", addr, err)
 	}
+	conn.SetDeadline(time.Time{})
 	client := ssh.NewClient(sshConn, chans, reqs)
 	defer client.Close()
 
@@ -81,7 +95,7 @@ func (p *SSHProbe) ProbeHost(ctx context.Context, host TailnetHost) ([]target, e
 	var results []target
 
 	// ss -tlnp
-	ssPorts := p.runSS(ctx, client)
+	ssPorts := p.runSS(conn, client)
 	portToTarget := make(map[int]target, len(ssPorts))
 	for _, port := range ssPorts {
 		portToTarget[port] = target{
@@ -93,7 +107,7 @@ func (p *SSHProbe) ProbeHost(ctx context.Context, host TailnetHost) ([]target, e
 	}
 
 	// docker ps — merge: prefer Docker metadata when port appears in both.
-	containers := p.runDockerPS(ctx, client)
+	containers := p.runDockerPS(conn, client)
 	for _, c := range containers {
 		dc := c // copy for pointer stability
 		for _, port := range dc.Ports {
@@ -114,7 +128,18 @@ func (p *SSHProbe) ProbeHost(ctx context.Context, host TailnetHost) ([]target, e
 	return results, nil
 }
 
-func (p *SSHProbe) runSS(ctx context.Context, client *ssh.Client) []int {
+// withCommandDeadline bounds a blocking SSH command by setting a deadline on
+// the underlying transport conn (sess.Output has no context/timeout support
+// of its own), running fn, then clearing the deadline.
+func (p *SSHProbe) withCommandDeadline(conn net.Conn, fn func() error) error {
+	if err := conn.SetDeadline(time.Now().Add(p.timeout)); err != nil {
+		return err
+	}
+	defer conn.SetDeadline(time.Time{})
+	return fn()
+}
+
+func (p *SSHProbe) runSS(conn net.Conn, client *ssh.Client) []int {
 	sess, err := client.NewSession()
 	if err != nil {
 		p.log.Debug("ssh: new session failed for ss", "err", err)
@@ -122,7 +147,12 @@ func (p *SSHProbe) runSS(ctx context.Context, client *ssh.Client) []int {
 	}
 	defer sess.Close()
 
-	output, err := sess.Output("ss -tlnp")
+	var output []byte
+	err = p.withCommandDeadline(conn, func() error {
+		var runErr error
+		output, runErr = sess.Output("ss -tlnp")
+		return runErr
+	})
 	if err != nil {
 		p.log.Warn("ssh: ss -tlnp failed", "err", err)
 		return nil
@@ -136,7 +166,7 @@ func (p *SSHProbe) runSS(ctx context.Context, client *ssh.Client) []int {
 	return ports
 }
 
-func (p *SSHProbe) runDockerPS(ctx context.Context, client *ssh.Client) []DockerContainer {
+func (p *SSHProbe) runDockerPS(conn net.Conn, client *ssh.Client) []DockerContainer {
 	sess, err := client.NewSession()
 	if err != nil {
 		p.log.Debug("ssh: new session failed for docker ps", "err", err)
@@ -144,7 +174,12 @@ func (p *SSHProbe) runDockerPS(ctx context.Context, client *ssh.Client) []Docker
 	}
 	defer sess.Close()
 
-	output, err := sess.Output("docker ps --format '{{json .}}'")
+	var output []byte
+	err = p.withCommandDeadline(conn, func() error {
+		var runErr error
+		output, runErr = sess.Output("docker ps --format '{{json .}}'")
+		return runErr
+	})
 	if err != nil {
 		if strings.Contains(err.Error(), "permission denied") {
 			p.log.Info("ssh: docker ps permission denied — add user to docker group on remote host", "err", err)

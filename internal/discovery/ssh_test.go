@@ -56,7 +56,7 @@ State    Recv-Q   Send-Q     Local Address:Port     Peer Address:Port  Process
 LISTEN   0        4096       0.0.0.0:8080           0.0.0.0:*          users:(("someprocess",pid=1,fd=3))
 `)
 	dockerOut := []byte(`
-{"Names":["/nginx"],"Ports":[{"PublicPort":8080,"Type":"tcp"}],"Labels":{"portico.name":"MyWeb"}}
+{"Names":"nginx","Ports":"0.0.0.0:8080->80/tcp","Labels":"portico.name=MyWeb"}
 `)
 
 	dockerProbe := NewDockerProbe(nil)
@@ -77,19 +77,19 @@ LISTEN   0        4096       0.0.0.0:8080           0.0.0.0:*          users:(("
 	}
 
 	portToTarget := make(map[int]struct {
-		Name     string
+		Name      string
 		HasDocker bool
 	})
 	for _, port := range ssPorts {
 		portToTarget[port] = struct {
-			Name     string
+			Name      string
 			HasDocker bool
 		}{Name: "ss-port"}
 	}
 	for _, c := range containers {
 		for _, port := range c.Ports {
 			portToTarget[port] = struct {
-				Name     string
+				Name      string
 				HasDocker bool
 			}{Name: c.Name, HasDocker: true}
 		}

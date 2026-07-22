@@ -74,17 +74,17 @@ func (p *SSHProbe) ProbeHost(ctx context.Context, host TailnetHost) ([]target, e
 	// does not apply to NewClientConn's handshake on an already-open conn,
 	// so a stalling peer would otherwise hang here indefinitely.
 	if err := conn.SetDeadline(time.Now().Add(p.timeout)); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("set handshake deadline %s: %w", addr, err)
 	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("ssh handshake %s: %w", addr, err)
 	}
-	conn.SetDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 	client := ssh.NewClient(sshConn, chans, reqs)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	hostname := host.Hostname
 	if hostname == "" {
@@ -135,7 +135,7 @@ func (p *SSHProbe) withCommandDeadline(conn net.Conn, fn func() error) error {
 	if err := conn.SetDeadline(time.Now().Add(p.timeout)); err != nil {
 		return err
 	}
-	defer conn.SetDeadline(time.Time{})
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	return fn()
 }
 
@@ -145,7 +145,7 @@ func (p *SSHProbe) runSS(conn net.Conn, client *ssh.Client) []int {
 		p.log.Debug("ssh: new session failed for ss", "err", err)
 		return nil
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	var output []byte
 	err = p.withCommandDeadline(conn, func() error {
@@ -172,7 +172,7 @@ func (p *SSHProbe) runDockerPS(conn net.Conn, client *ssh.Client) []DockerContai
 		p.log.Debug("ssh: new session failed for docker ps", "err", err)
 		return nil
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	var output []byte
 	err = p.withCommandDeadline(conn, func() error {

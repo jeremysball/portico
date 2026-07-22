@@ -17,27 +17,30 @@ import (
 
 // Config controls the discovery orchestrator.
 type Config struct {
-	Interval         time.Duration // how often to rescan local Docker containers (default 5s)
-	TailnetInterval  time.Duration // how often to probe tailnet peers (default 30s; each pass fans out Ports x hosts requests, so this runs far less often than Interval)
-	IdentifyInterval time.Duration // how often to run nmap service/version identification against already-online services (default 6h; deliberately rare, this is not a scan)
-	ProbeTimeout     time.Duration // per-request HTTP timeout (default 1.5s)
-	Concurrency      int           // max in-flight probes (default 40)
-	Ports            []int         // common ports to probe on every tailnet host
-	DockerSocket     string
-	TailscaleSocket  string
-	SSHEnabled       bool          // SSH_ENABLED env (default false)
-	SSHUser          string        // SSH_USER env (default "root"); many Tailscale SSH policies only permit non-root users
-	SSHInterval      time.Duration // SSH_INTERVAL env (default 5m)
-	SSHTimeout       time.Duration // SSH_TIMEOUT env, per-host dial+command (default 15s)
-	SSHConcurrency   int           // SSH_CONCURRENCY env (default 3)
+	Interval             time.Duration // how often to rescan local Docker containers (default 5s)
+	TailnetInterval      time.Duration // how often to recheck already-known tailnet services (default 30s; probes only their exact host:port, so this stays cheap regardless of Ports' size)
+	TailnetSweepInterval time.Duration // how often to fan out the full Ports x hosts scan looking for new tailnet services (default 6h; deliberately rare since this is the expensive pass — new services are normally found via the manual per-host refresh button instead)
+	IdentifyInterval     time.Duration // how often to run nmap service/version identification against already-online services (default 6h; deliberately rare, this is not a scan)
+	ProbeTimeout         time.Duration // per-request HTTP timeout (default 1.5s)
+	Concurrency          int           // max in-flight probes (default 40)
+	Ports                []int         // common ports to probe on every tailnet host
+	DockerSocket         string
+	TailscaleSocket      string
+	SSHEnabled           bool          // SSH_ENABLED env (default false)
+	SSHUser              string        // SSH_USER env (default "root"); many Tailscale SSH policies only permit non-root users
+	SSHInterval          time.Duration // SSH_INTERVAL env (default 5m)
+	SSHTimeout           time.Duration // SSH_TIMEOUT env, per-host dial+command (default 15s)
+	SSHConcurrency       int           // SSH_CONCURRENCY env (default 3)
 }
 
 // Orchestrator ties the discovery sources together and keeps a
-// registry.Registry up to date. Docker (cheap, local) and tailnet (expensive,
-// cross-network) run on independent tickers so a large tailnet doesn't force
-// local updates to lag, and so tailnet peers aren't hammered as often. A
-// third, much slower ticker opportunistically identifies what's actually
-// running on already-discovered services via nmap.
+// registry.Registry up to date. Docker (cheap, local) runs on its own
+// ticker. Tailnet probing is split into two: a frequent recheck of services
+// already known (cheap — one probe per known host:port) and a rare full
+// sweep of every port against every peer (expensive — the only pass that
+// discovers brand-new services, so it stays automatic without needing the
+// recheck's traffic volume). A separate, much slower ticker opportunistically
+// identifies what's actually running on already-discovered services via nmap.
 type Orchestrator struct {
 	cfg           Config
 	dockerProbe   *DockerProbe
@@ -80,10 +83,11 @@ func (o *Orchestrator) Run(ctx context.Context) {
 	}
 	go o.loop(ctx, o.cfg.Interval, o.dockerPass)
 	go o.loopDelayed(ctx, 2*time.Minute, o.cfg.IdentifyInterval, o.identifyPass)
+	go o.loop(ctx, o.cfg.TailnetInterval, o.recheckPass)
 	if o.sshProbe != nil {
 		go o.loopDelayed(ctx, 30*time.Second, o.cfg.SSHInterval, o.sshPass)
 	}
-	o.loop(ctx, o.cfg.TailnetInterval, o.tailnetPass)
+	o.loop(ctx, o.cfg.TailnetSweepInterval, o.sweepPass)
 }
 
 func (o *Orchestrator) loop(ctx context.Context, interval time.Duration, pass func(context.Context)) {
@@ -126,8 +130,8 @@ func (o *Orchestrator) loopDelayed(ctx context.Context, startDelay, interval tim
 // target is a single (address, port) to probe, optionally enriched with
 // Docker label metadata.
 type target struct {
-	host   string // display hostname
-	fqdn   string // full hostname from tailscale
+	host   string // short display hostname
+	fqdn   string // full DNS hostname for URL/SNI, may be empty (falls back to host)
 	addr   string // dial address
 	port   int
 	docker *DockerContainer
@@ -139,14 +143,16 @@ type probedResult struct {
 	id     string
 	source string
 	host   string
+	fqdn   string
 	addr   string
 	port   int
 	res    *ProbeResult
 	docker *DockerContainer
 }
 
-// selfHostname resolves this node's display hostname: the tailnet hostname
-// when available (cheap local IPC, not a network probe), else the OS hostname.
+// selfHostname resolves this node's short display hostname: the tailnet
+// hostname when available (cheap local IPC, not a network probe), else the OS
+// hostname. Used for grouping/category, never for building URLs.
 func (o *Orchestrator) selfHostname(ctx context.Context) string {
 	if h, err := os.Hostname(); err == nil {
 		if o.tailnet.Available(ctx) {
@@ -155,6 +161,19 @@ func (o *Orchestrator) selfHostname(ctx context.Context) string {
 			}
 		}
 		return h
+	}
+	return ""
+}
+
+// selfFQDN resolves this node's full tailnet DNS name, used to build URLs and
+// TLS SNI for Docker-discovered services so they match what a browser sees.
+// Returns "" when tailscale isn't available; callers fall back to the short
+// hostname in that case.
+func (o *Orchestrator) selfFQDN(ctx context.Context) string {
+	if o.tailnet.Available(ctx) {
+		if fq, err := o.tailnet.SelfFQDN(ctx); err == nil {
+			return fq
+		}
 	}
 	return ""
 }
@@ -171,6 +190,7 @@ func (o *Orchestrator) dockerPass(ctx context.Context) {
 	}
 
 	selfHost := o.selfHostname(passCtx)
+	selfFQDN := o.selfFQDN(passCtx)
 
 	containers, err := o.dockerProbe.Local(passCtx)
 	if err != nil {
@@ -194,7 +214,7 @@ func (o *Orchestrator) dockerPass(ctx context.Context) {
 				existing.docker = &c
 				continue
 			}
-			targets[key] = &target{host: selfHost, addr: "localhost", port: port, docker: &c}
+			targets[key] = &target{host: selfHost, fqdn: selfFQDN, addr: "localhost", port: port, docker: &c}
 		}
 	}
 
@@ -211,9 +231,9 @@ func (o *Orchestrator) dockerPass(ctx context.Context) {
 
 	for _, es := range explicit {
 		id := dockerID(es.host, es.port)
-		if res, ok := o.prober.ProbeScheme(passCtx, es.scheme, es.addr, es.port); ok {
+		if res, ok := o.prober.ProbeScheme(passCtx, es.scheme, es.host, es.addr, es.port); ok {
 			resultsMu.Lock()
-			results = append(results, probedResult{id: id, source: "docker", host: es.host, addr: es.addr, port: es.port, res: res, docker: es.docker})
+			results = append(results, probedResult{id: id, source: "docker", host: es.host, fqdn: es.host, addr: es.addr, port: es.port, res: res, docker: es.docker})
 			resultsMu.Unlock()
 		} else {
 			// Trust the label even if the probe failed (e.g. odd auth); still
@@ -233,31 +253,79 @@ func (o *Orchestrator) dockerPass(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			res, ok := o.prober.Probe(passCtx, t.addr, t.port)
+			res, ok := o.prober.Probe(passCtx, t.fqdn, t.addr, t.port)
 			if !ok {
 				return
 			}
 			id := dockerID(t.host, t.port)
 			resultsMu.Lock()
-			results = append(results, probedResult{id: id, source: "docker", host: t.host, addr: t.addr, port: t.port, res: res, docker: t.docker})
+			results = append(results, probedResult{id: id, source: "docker", host: t.host, fqdn: t.fqdn, addr: t.addr, port: t.port, res: res, docker: t.docker})
 			resultsMu.Unlock()
 		}()
 	}
 	wg.Wait()
 
 	for _, r := range dedupeSameService(results) {
-		o.upsertFromProbe(r.id, r.source, r.host, r.addr, r.port, r.res, r.docker)
+		o.upsertFromProbe(r.id, r.source, r.host, r.fqdn, r.addr, r.port, r.res, r.docker)
 		markSeen(r.id)
 	}
 
 	o.reg.MarkOfflineExceptForSource("docker", seen)
 }
 
-// tailnetPass probes every configured port on every online tailnet host,
+// recheckPass reprobes only the tailnet services already sitting in the
+// registry, one request per known host:port. This is what runs on the
+// frequent TailnetInterval and owns marking tailnet services offline: since
+// it always covers every currently-known service, a service missing from its
+// results is actually down, not just skipped by a rarer pass.
+func (o *Orchestrator) recheckPass(ctx context.Context) {
+	passCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	known := o.reg.ListSource("tailscale")
+	if len(known) == 0 {
+		return
+	}
+
+	var results []probedResult
+	var resultsMu sync.Mutex
+
+	sem := make(chan struct{}, max(1, o.cfg.Concurrency))
+	var wg sync.WaitGroup
+	for _, s := range known {
+		s := s
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, ok := o.prober.Probe(passCtx, s.FQDN, s.Address, s.Port)
+			if !ok {
+				return
+			}
+			resultsMu.Lock()
+			results = append(results, probedResult{id: s.ID, source: "tailscale", host: s.Host, fqdn: s.FQDN, addr: s.Address, port: s.Port, res: res})
+			resultsMu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	seen := make(map[string]struct{}, len(results))
+	for _, r := range results {
+		o.upsertFromProbe(r.id, r.source, r.host, r.fqdn, r.addr, r.port, r.res, r.docker)
+		seen[r.id] = struct{}{}
+	}
+
+	o.reg.MarkOfflineExceptForSource("tailscale", seen)
+}
+
+// sweepPass probes every configured port on every online tailnet host,
 // including this one. This is the expensive fan-out (Ports x hosts HTTP
-// requests each pass), so it runs on the slower TailnetInterval.
-func (o *Orchestrator) tailnetPass(ctx context.Context) {
-	passCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+// requests each pass) that discovers brand-new services, so it runs on the
+// much slower TailnetSweepInterval; recheckPass, not this pass, is what
+// keeps already-known services' online status current between sweeps.
+func (o *Orchestrator) sweepPass(ctx context.Context) {
+	passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	if !o.tailnet.Available(passCtx) {
@@ -269,22 +337,69 @@ func (o *Orchestrator) tailnetPass(ctx context.Context) {
 		return
 	}
 
+	for _, r := range o.probeHosts(passCtx, hosts, o.cfg.Ports) {
+		o.upsertFromProbe(r.id, r.source, r.host, r.fqdn, r.addr, r.port, r.res, r.docker)
+	}
+}
+
+// SweepHost runs a full Ports scan against a single named tailnet host,
+// on demand — the manual-refresh counterpart to sweepPass, for a user who
+// knows exactly which peer just started running a new service and doesn't
+// want to wait for the next scheduled sweep.
+func (o *Orchestrator) SweepHost(ctx context.Context, host string) error {
+	passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if !o.tailnet.Available(passCtx) {
+		return fmt.Errorf("tailscale not available")
+	}
+	hosts, err := o.tailnet.Hosts(passCtx)
+	if err != nil {
+		return fmt.Errorf("tailscale status: %w", err)
+	}
+
+	var matched *TailnetHost
+	for i := range hosts {
+		if hosts[i].Hostname == host {
+			matched = &hosts[i]
+			break
+		}
+	}
+	if matched == nil {
+		return fmt.Errorf("host %q not found on tailnet", host)
+	}
+
+	results := o.probeHosts(passCtx, []TailnetHost{*matched}, o.cfg.Ports)
+	seen := make(map[string]struct{}, len(results))
+	for _, r := range results {
+		o.upsertFromProbe(r.id, r.source, r.host, r.fqdn, r.addr, r.port, r.res, r.docker)
+		seen[r.id] = struct{}{}
+	}
+	o.reg.MarkOfflineExceptForHostSource("tailscale", host, seen)
+	return nil
+}
+
+// probeHosts fans out an HTTP probe for every port against every host,
+// deduped the same way a regular tailnet pass is. Shared by sweepPass (all
+// hosts) and SweepHost (a single host).
+func (o *Orchestrator) probeHosts(ctx context.Context, hosts []TailnetHost, ports []int) []probedResult {
 	targets := map[string]*target{}
 	for _, h := range hosts {
 		if len(h.IPs) == 0 {
 			continue
 		}
 		hostname := h.Hostname
+		fqdn := h.FQDN
 		addr := h.IPs[0].String()
 		if hostname == "" {
 			hostname = addr
 		}
-		for _, port := range o.cfg.Ports {
+		for _, port := range ports {
 			key := fmt.Sprintf("%s|%d", addr, port)
 			if _, ok := targets[key]; ok {
 				continue
 			}
-			targets[key] = &target{host: hostname, addr: addr, port: port}
+			targets[key] = &target{host: hostname, fqdn: fqdn, addr: addr, port: port}
 		}
 	}
 
@@ -300,26 +415,19 @@ func (o *Orchestrator) tailnetPass(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			res, ok := o.prober.Probe(passCtx, t.addr, t.port)
+			res, ok := o.prober.Probe(ctx, t.fqdn, t.addr, t.port)
 			if !ok {
 				return
 			}
 			id := fmt.Sprintf("%s:%d", t.host, t.port)
 			resultsMu.Lock()
-			results = append(results, probedResult{id: id, source: "tailscale", host: t.host, addr: t.addr, port: t.port, res: res})
+			results = append(results, probedResult{id: id, source: "tailscale", host: t.host, fqdn: t.fqdn, addr: t.addr, port: t.port, res: res})
 			resultsMu.Unlock()
 		}()
 	}
 	wg.Wait()
 
-	deduped := dedupeSameService(results)
-	seen := make(map[string]struct{}, len(deduped))
-	for _, r := range deduped {
-		o.upsertFromProbe(r.id, r.source, r.host, r.addr, r.port, r.res, r.docker)
-		seen[r.id] = struct{}{}
-	}
-
-	o.reg.MarkOfflineExceptForSource("tailscale", seen)
+	return dedupeSameService(results)
 }
 
 // dedupeSameService drops results that are just a same-host duplicate of
@@ -379,16 +487,20 @@ func sshID(host string, port int) string {
 	return fmt.Sprintf("ssh:%s:%d", host, port)
 }
 
-func (o *Orchestrator) upsertFromProbe(id, source, host, addr string, port int, res *ProbeResult, dc *DockerContainer) {
+func (o *Orchestrator) upsertFromProbe(id, source, host, fqdn, addr string, port int, res *ProbeResult, dc *DockerContainer) {
+	urlHost := fqdn
+	if urlHost == "" {
+		urlHost = host
+	}
 	svc := registry.Service{
 		ID:       id,
 		Host:     host,
+		FQDN:     fqdn,
 		Address:  addr,
 		Port:     port,
 		Scheme:   res.Scheme,
-		URL:      fmt.Sprintf("%s://%s:%d/", res.Scheme, host, port),
+		URL:      fmt.Sprintf("%s://%s:%d/", res.Scheme, urlHost, port),
 		Title:    res.Title,
-		Icon:     res.Icon,
 		Source:   source,
 		Category: host,
 	}
@@ -420,6 +532,7 @@ func (o *Orchestrator) upsertExplicit(id string, es explicitService) {
 	svc := registry.Service{
 		ID:       id,
 		Host:     es.host,
+		FQDN:     es.host,
 		Address:  es.addr,
 		Port:     es.port,
 		Scheme:   es.scheme,
@@ -524,7 +637,7 @@ func (o *Orchestrator) sshPass(ctx context.Context) {
 
 	hostSem := make(chan struct{}, max(1, o.cfg.SSHConcurrency))
 	var allTargets []target
-	var failedHosts []string
+	var okHosts []string
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -543,9 +656,9 @@ func (o *Orchestrator) sshPass(ctx context.Context) {
 			defer mu.Unlock()
 			if err != nil {
 				o.log.Debug("ssh probe failed", "host", h.Hostname, "err", err)
-				failedHosts = append(failedHosts, h.Hostname)
 				return
 			}
+			okHosts = append(okHosts, h.Hostname)
 			allTargets = append(allTargets, targets...)
 		}()
 	}
@@ -554,28 +667,16 @@ func (o *Orchestrator) sshPass(ctx context.Context) {
 	probed := o.probeHostsFromTargets(passCtx, allTargets)
 	seen := make(map[string]struct{}, len(probed))
 	for _, r := range probed {
-		o.upsertFromProbe(r.id, r.source, r.host, r.addr, r.port, r.res, r.docker)
+		o.upsertFromProbe(r.id, r.source, r.host, r.fqdn, r.addr, r.port, r.res, r.docker)
 		seen[r.id] = struct{}{}
 	}
-	// A host whose SSH probe failed this pass contributed nothing to `seen`;
-	// without this, MarkOfflineExceptForSource would wrongly flip its
-	// previously-discovered services offline on a merely transient failure.
-	// Preserve them by treating their prior IDs as still seen.
-	if len(failedHosts) > 0 {
-		failed := make(map[string]struct{}, len(failedHosts))
-		for _, h := range failedHosts {
-			failed[h] = struct{}{}
-		}
-		for _, s := range o.reg.List() {
-			if s.Source != "tailscale-ssh" {
-				continue
-			}
-			if _, ok := failed[s.Host]; ok {
-				seen[s.ID] = struct{}{}
-			}
-		}
+	// A host whose SSH probe failed this pass is left untouched entirely: no
+	// call to MarkOfflineExceptForHostSource for it, so its previously-known
+	// services keep whatever online state they already had rather than being
+	// wrongly flipped offline by a merely transient failure.
+	for _, host := range okHosts {
+		o.reg.MarkOfflineExceptForHostSource("tailscale-ssh", host, seen)
 	}
-	o.reg.MarkOfflineExceptForSource("tailscale-ssh", seen)
 }
 
 // probeHostsFromTargets probes a slice of target values with concurrency,
@@ -593,13 +694,13 @@ func (o *Orchestrator) probeHostsFromTargets(ctx context.Context, targets []targ
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			res, ok := o.prober.Probe(ctx, t.addr, t.port)
+			res, ok := o.prober.Probe(ctx, t.fqdn, t.addr, t.port)
 			if !ok {
 				return
 			}
 			id := sshID(t.host, t.port)
 			resultsMu.Lock()
-			results = append(results, probedResult{id: id, source: "tailscale-ssh", host: t.host, addr: t.addr, port: t.port, res: res, docker: t.docker})
+			results = append(results, probedResult{id: id, source: "tailscale-ssh", host: t.host, fqdn: t.fqdn, addr: t.addr, port: t.port, res: res, docker: t.docker})
 			resultsMu.Unlock()
 		}()
 	}

@@ -10,6 +10,49 @@ function initials(name) {
   return name.slice(0, 2).toUpperCase();
 }
 
+// Uptime bar: a fixed-width row of buckets spanning the same 7-day window
+// the backend retains history for (see historyRetention in registry.go),
+// always rendered on the tile — no click needed to see it.
+const UPTIME_BUCKETS = 28;
+const UPTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const UPTIME_BUCKET_MS = UPTIME_WINDOW_MS / UPTIME_BUCKETS;
+
+// Turns a service's history (transition timestamps, already sorted
+// ascending by the backend) into one state per bucket: false if any offline
+// moment touched the bucket (outages shorter than a bucket must still show,
+// so offline always wins ties within a bucket), true if only online moments
+// touched it, null if the window predates any recorded history.
+function computeUptimeBars(history, now) {
+  const windowStart = now - UPTIME_WINDOW_MS;
+  const bars = new Array(UPTIME_BUCKETS).fill(null);
+  if (history.length === 0) return bars;
+
+  for (let i = 0; i < history.length; i++) {
+    const segStart = new Date(history[i].time).getTime();
+    const segEnd = i + 1 < history.length ? new Date(history[i + 1].time).getTime() : now;
+    const online = history[i].online;
+
+    const start = Math.max(segStart, windowStart);
+    const end = Math.min(segEnd, now);
+    if (end <= start) continue;
+
+    const firstBucket = Math.max(0, Math.floor((start - windowStart) / UPTIME_BUCKET_MS));
+    const lastBucket = Math.min(UPTIME_BUCKETS - 1, Math.ceil((end - windowStart) / UPTIME_BUCKET_MS) - 1);
+    for (let b = firstBucket; b <= lastBucket; b++) {
+      if (bars[b] === false) continue; // offline already wins this bucket
+      bars[b] = online === false ? false : true;
+    }
+  }
+  return bars;
+}
+
+function uptimeSummary(bars) {
+  const known = bars.filter((b) => b !== null);
+  if (known.length === 0) return "No history yet";
+  const onlinePct = Math.round((known.filter(Boolean).length / known.length) * 100);
+  return `${onlinePct}% uptime (7d)`;
+}
+
 function groupBy(services) {
   const groups = new Map();
   for (const s of services) {
@@ -53,11 +96,16 @@ function buildTile() {
   detected.className = "detected";
   a.appendChild(detected);
 
-  const history = document.createElement("button");
-  history.className = "history-btn";
-  history.textContent = "\u{1F550}";
-  history.title = "View history";
-  a.appendChild(history);
+  const uptime = document.createElement("div");
+  uptime.className = "uptime";
+  const uptimeBars = [];
+  for (let i = 0; i < UPTIME_BUCKETS; i++) {
+    const bar = document.createElement("span");
+    bar.className = "uptime-bar";
+    uptime.appendChild(bar);
+    uptimeBars.push(bar);
+  }
+  a.appendChild(uptime);
 
   const edit = document.createElement("button");
   edit.className = "edit-btn";
@@ -65,11 +113,11 @@ function buildTile() {
   edit.title = "Rename / recategorize / hide";
   a.appendChild(edit);
 
-  return { el: a, icon, name, meta, detected, history, edit };
+  return { el: a, icon, name, meta, detected, uptime, uptimeBars, edit };
 }
 
 function updateTile(tile, s) {
-  const { el, icon, name, meta, detected, history, edit } = tile;
+  const { el, icon, name, meta, detected, uptime, uptimeBars, edit } = tile;
 
   const wantOffline = !s.online;
   el.classList.toggle("offline", wantOffline);
@@ -105,12 +153,15 @@ function updateTile(tile, s) {
   if (detected.textContent !== detectedText) detected.textContent = detectedText;
   detected.hidden = !detectedText;
 
+  const bars = computeUptimeBars(s.history || [], Date.now());
+  uptime.title = uptimeSummary(bars);
+  bars.forEach((state, i) => {
+    const bar = uptimeBars[i];
+    const wantClass = state === null ? "uptime-bar" : state ? "uptime-bar online" : "uptime-bar offline";
+    if (bar.className !== wantClass) bar.className = wantClass;
+  });
+
   // Rebind each render so the handlers always close over the latest service.
-  history.onclick = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    showHistory(s);
-  };
   edit.onclick = (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -145,13 +196,21 @@ function render(services) {
     let sec = sectionEls.get(cat);
     if (!sec) {
       const section = document.createElement("section");
+      const heading = document.createElement("div");
+      heading.className = "section-heading";
       const h2 = document.createElement("h2");
       h2.textContent = cat;
-      section.appendChild(h2);
+      heading.appendChild(h2);
+      const refresh = document.createElement("button");
+      refresh.className = "refresh-btn";
+      refresh.innerHTML = '<span class="refresh-icon">\u{21BB}</span><span class="refresh-label">refresh</span>';
+      refresh.onclick = () => refreshHost(refresh.dataset.host, refresh);
+      heading.appendChild(refresh);
+      section.appendChild(heading);
       const grid = document.createElement("div");
       grid.className = "grid";
       section.appendChild(grid);
-      sec = { section, h2, grid };
+      sec = { section, h2, grid, refresh };
       sectionEls.set(cat, sec);
     }
     app.appendChild(sec.section); // no-op if already last, else moves into place
@@ -159,6 +218,15 @@ function render(services) {
     const items = groups
       .get(cat)
       .sort((a, b) => displayName(a).localeCompare(displayName(b)));
+
+    // Category is user-renameable and can in principle mix services from
+    // different hosts; refresh only makes sense when the section maps
+    // cleanly onto exactly one real host.
+    const hosts = new Set(items.map((s) => s.host));
+    const sectionHost = hosts.size === 1 ? items[0].host : null;
+    sec.refresh.hidden = !sectionHost;
+    sec.refresh.dataset.host = sectionHost || "";
+    sec.refresh.title = sectionHost ? `Scan ${sectionHost} for new services now` : "";
 
     for (const s of items) {
       seenIds.add(s.id);
@@ -186,19 +254,6 @@ function render(services) {
   }
 }
 
-function showHistory(s) {
-  const dn = displayName(s);
-  if (!s.history || s.history.length === 0) {
-    alert(`${dn}\n\nNo history recorded yet.`);
-    return;
-  }
-  const lines = s.history
-    .slice()
-    .reverse()
-    .map((h) => `${new Date(h.time).toLocaleString()} — ${h.online ? "online" : "offline"}`);
-  alert(`${dn} — history (last 7 days)\n\n${lines.join("\n")}`);
-}
-
 async function openEditor(s) {
   const name = prompt("Display name", s.nameOverride || s.title || "");
   if (name === null) return;
@@ -212,6 +267,26 @@ async function openEditor(s) {
     body: JSON.stringify({ name, category, hidden }),
   });
   refresh();
+}
+
+async function refreshHost(host, btn) {
+  if (!host) return;
+  const label = btn.querySelector(".refresh-label");
+  const original = label.textContent;
+  btn.disabled = true;
+  btn.classList.add("spinning");
+  label.textContent = "scanning…";
+  try {
+    const res = await fetch(`/api/hosts/${encodeURIComponent(host)}/refresh`, { method: "POST" });
+    if (!res.ok) throw new Error(await res.text());
+    await refresh();
+  } catch (err) {
+    alert(`Couldn't scan ${host}:\n${err.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("spinning");
+    label.textContent = original;
+  }
 }
 
 async function refresh() {

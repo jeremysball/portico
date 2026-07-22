@@ -40,23 +40,24 @@ func main() {
 	reg := registry.New(dataDir)
 
 	discCfg := discovery.Config{
-		Interval:         getEnvDuration("DISCOVERY_INTERVAL", 5*time.Second),
-		TailnetInterval:  getEnvDuration("TAILNET_INTERVAL", 30*time.Second),
-		IdentifyInterval: getEnvDuration("IDENTIFY_INTERVAL", 6*time.Hour),
-		ProbeTimeout:     getEnvDuration("PROBE_TIMEOUT", 1500*time.Millisecond),
-		Concurrency:      getEnvInt("PROBE_CONCURRENCY", 40),
-		Ports:            getEnvPorts("PORTS", defaultPorts),
-		SSHEnabled:       getEnv("SSH_ENABLED", "false") == "true",
-		SSHUser:          getEnv("SSH_USER", discovery.SSHPUser),
-		SSHInterval:      getEnvDuration("SSH_INTERVAL", 5*time.Minute),
-		SSHTimeout:       getEnvDuration("SSH_TIMEOUT", 15*time.Second),
-		SSHConcurrency:   getEnvInt("SSH_CONCURRENCY", 3),
-		DockerSocket:     getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
-		TailscaleSocket:  getEnv("TAILSCALE_SOCKET", "/var/run/tailscale/tailscaled.sock"),
+		Interval:             getEnvDuration("DISCOVERY_INTERVAL", 5*time.Second),
+		TailnetInterval:      getEnvDuration("TAILNET_INTERVAL", 30*time.Second),
+		TailnetSweepInterval: getEnvDuration("TAILNET_SWEEP_INTERVAL", 6*time.Hour),
+		IdentifyInterval:     getEnvDuration("IDENTIFY_INTERVAL", 6*time.Hour),
+		ProbeTimeout:         getEnvDuration("PROBE_TIMEOUT", 1500*time.Millisecond),
+		Concurrency:          getEnvInt("PROBE_CONCURRENCY", 40),
+		Ports:                getEnvPorts("PORTS", defaultPorts),
+		SSHEnabled:           getEnv("SSH_ENABLED", "false") == "true",
+		SSHUser:              getEnv("SSH_USER", discovery.SSHPUser),
+		SSHInterval:          getEnvDuration("SSH_INTERVAL", 5*time.Minute),
+		SSHTimeout:           getEnvDuration("SSH_TIMEOUT", 15*time.Second),
+		SSHConcurrency:       getEnvInt("SSH_CONCURRENCY", 3),
+		DockerSocket:         getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
+		TailscaleSocket:      getEnv("TAILSCALE_SOCKET", "/var/run/tailscale/tailscaled.sock"),
 	}
 	orch := discovery.NewOrchestrator(discCfg, reg, log)
 
-	srv := web.New(reg, log, getEnv("SITE_TITLE", "Home"))
+	srv := web.New(reg, log, getEnv("SITE_TITLE", "Home"), orch)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -28,8 +28,9 @@ const (
 // Service is one discovered (or user-added) endpoint.
 type Service struct {
 	ID        string    `json:"id"`
-	Host      string    `json:"host"`    // tailnet hostname, e.g. "myhost"
-	Address   string    `json:"address"` // IP the port was reached on
+	Host      string    `json:"host"`           // short display hostname, e.g. "myhost" — used for grouping, never for URLs
+	FQDN      string    `json:"fqdn,omitempty"` // full tailnet DNS name used to build URL/SNI, e.g. "myhost.tailnet.ts.net"; falls back to Host when empty
+	Address   string    `json:"address"`        // IP (or "localhost") the port was reached on
 	Port      int       `json:"port"`
 	Scheme    string    `json:"scheme"` // "http" or "https"
 	URL       string    `json:"url"`
@@ -146,7 +147,7 @@ func (r *Registry) save() {
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return
 	}
-	os.Rename(tmp, r.path)
+	_ = os.Rename(tmp, r.path)
 }
 
 // Upsert merges a freshly-discovered service into the registry, preserving
@@ -206,6 +207,43 @@ func (r *Registry) MarkOfflineExceptForSource(source string, seen map[string]str
 	changed := false
 	for id, s := range r.services {
 		if s.Source != source {
+			continue
+		}
+		if _, ok := seen[id]; !ok && s.Online {
+			s.Online = false
+			s.History = appendTransition(s.History, false)
+			r.services[id] = s
+			changed = true
+		}
+	}
+	r.mu.Unlock()
+	if changed {
+		r.save()
+		r.notify()
+	}
+}
+
+// ListSource returns all services with the given source, unsorted.
+func (r *Registry) ListSource(source string) []Service {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	svcs := make([]Service, 0, len(r.services))
+	for _, s := range r.services {
+		if s.Source == source {
+			svcs = append(svcs, s)
+		}
+	}
+	return svcs
+}
+
+// MarkOfflineExceptForHostSource is like MarkOfflineExceptForSource but
+// scoped to a single host, so a manual per-host refresh can't flip other
+// hosts' services offline just because this pass didn't touch them.
+func (r *Registry) MarkOfflineExceptForHostSource(source, host string, seen map[string]struct{}) {
+	r.mu.Lock()
+	changed := false
+	for id, s := range r.services {
+		if s.Source != source || s.Host != host {
 			continue
 		}
 		if _, ok := seen[id]; !ok && s.Online {

@@ -26,6 +26,11 @@ type Config struct {
 	Ports                []int         // common ports to probe on every tailnet host
 	DockerSocket         string
 	TailscaleSocket      string
+	SSHEnabled           bool          // SSH_ENABLED env (default false)
+	SSHUser              string        // SSH_USER env (default "root"); many Tailscale SSH policies only permit non-root users
+	SSHInterval          time.Duration // SSH_INTERVAL env (default 5m)
+	SSHTimeout           time.Duration // SSH_TIMEOUT env, per-host dial+command (default 15s)
+	SSHConcurrency       int           // SSH_CONCURRENCY env (default 3)
 }
 
 // Orchestrator ties the discovery sources together and keeps a
@@ -38,9 +43,10 @@ type Config struct {
 // identifies what's actually running on already-discovered services via nmap.
 type Orchestrator struct {
 	cfg           Config
-	docker        *DockerClient
+	dockerProbe   *DockerProbe
 	tailnet       *TailscaleClient
 	prober        *Prober
+	sshProbe      *SSHProbe // nil when SSHEnabled=false
 	reg           *registry.Registry
 	log           *slog.Logger
 	nmapAvailable bool
@@ -48,15 +54,25 @@ type Orchestrator struct {
 
 func NewOrchestrator(cfg Config, reg *registry.Registry, log *slog.Logger) *Orchestrator {
 	_, nmapErr := exec.LookPath("nmap")
-	return &Orchestrator{
+	prober := NewProber(cfg.ProbeTimeout)
+	dockerClient := NewDockerClient(cfg.DockerSocket)
+	dockerProbe := NewDockerProbe(dockerClient)
+
+	o := &Orchestrator{
 		cfg:           cfg,
-		docker:        NewDockerClient(cfg.DockerSocket),
+		dockerProbe:   dockerProbe,
 		tailnet:       NewTailscaleClient(cfg.TailscaleSocket),
-		prober:        NewProber(cfg.ProbeTimeout),
+		prober:        prober,
 		reg:           reg,
 		log:           log,
 		nmapAvailable: nmapErr == nil,
 	}
+
+	if cfg.SSHEnabled {
+		o.sshProbe = NewSSHProbe(dockerProbe, cfg.SSHUser, cfg.SSHTimeout, cfg.SSHConcurrency, log)
+	}
+
+	return o
 }
 
 // Run blocks, scanning both sources immediately and then on their own
@@ -68,6 +84,9 @@ func (o *Orchestrator) Run(ctx context.Context) {
 	go o.loop(ctx, o.cfg.Interval, o.dockerPass)
 	go o.loopDelayed(ctx, 2*time.Minute, o.cfg.IdentifyInterval, o.identifyPass)
 	go o.loop(ctx, o.cfg.TailnetInterval, o.recheckPass)
+	if o.sshProbe != nil {
+		go o.loopDelayed(ctx, 30*time.Second, o.cfg.SSHInterval, o.sshPass)
+	}
 	o.loop(ctx, o.cfg.TailnetSweepInterval, o.sweepPass)
 }
 
@@ -166,14 +185,14 @@ func (o *Orchestrator) dockerPass(ctx context.Context) {
 	passCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	if !o.docker.Available(passCtx) {
+	if !o.dockerProbe.client.Available(passCtx) {
 		return
 	}
 
 	selfHost := o.selfHostname(passCtx)
 	selfFQDN := o.selfFQDN(passCtx)
 
-	containers, err := o.docker.List(passCtx)
+	containers, err := o.dockerProbe.Local(passCtx)
 	if err != nil {
 		o.log.Warn("docker list failed", "err", err)
 		return
@@ -462,6 +481,12 @@ func dockerID(host string, port int) string {
 	return fmt.Sprintf("docker:%s:%d", host, port)
 }
 
+// sshID namespaces SSH-sourced service IDs so they never collide with
+// tailnet or Docker IDs for the same host:port.
+func sshID(host string, port int) string {
+	return fmt.Sprintf("ssh:%s:%d", host, port)
+}
+
 func (o *Orchestrator) upsertFromProbe(id, source, host, fqdn, addr string, port int, res *ProbeResult, dc *DockerContainer) {
 	urlHost := fqdn
 	if urlHost == "" {
@@ -592,4 +617,94 @@ func (o *Orchestrator) identifyPass(ctx context.Context) {
 		}()
 	}
 	wg.Wait()
+}
+
+// sshPass probes tailnet hosts via SSH to discover reachable services,
+// using the SSHProbe to extract port mappings from remote Docker instances.
+// It only runs when SSHEnabled is true and sshProbe is non-nil.
+func (o *Orchestrator) sshPass(ctx context.Context) {
+	passCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	if !o.tailnet.Available(passCtx) {
+		return
+	}
+	hosts, err := o.tailnet.Hosts(passCtx)
+	if err != nil {
+		o.log.Warn("ssh pass: tailscale hosts failed", "err", err)
+		return
+	}
+
+	hostSem := make(chan struct{}, max(1, o.cfg.SSHConcurrency))
+	var allTargets []target
+	var okHosts []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, h := range hosts {
+		if h.IsSelf || len(h.IPs) == 0 {
+			continue
+		}
+		h := h
+		wg.Add(1)
+		hostSem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-hostSem }()
+			targets, err := o.sshProbe.ProbeHost(passCtx, h)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				o.log.Debug("ssh probe failed", "host", h.Hostname, "err", err)
+				return
+			}
+			okHosts = append(okHosts, h.Hostname)
+			allTargets = append(allTargets, targets...)
+		}()
+	}
+	wg.Wait()
+
+	probed := o.probeHostsFromTargets(passCtx, allTargets)
+	seen := make(map[string]struct{}, len(probed))
+	for _, r := range probed {
+		o.upsertFromProbe(r.id, r.source, r.host, r.fqdn, r.addr, r.port, r.res, r.docker)
+		seen[r.id] = struct{}{}
+	}
+	// A host whose SSH probe failed this pass is left untouched entirely: no
+	// call to MarkOfflineExceptForHostSource for it, so its previously-known
+	// services keep whatever online state they already had rather than being
+	// wrongly flipped offline by a merely transient failure.
+	for _, host := range okHosts {
+		o.reg.MarkOfflineExceptForHostSource("tailscale-ssh", host, seen)
+	}
+}
+
+// probeHostsFromTargets probes a slice of target values with concurrency,
+// returning deduplicated probedResult values.
+func (o *Orchestrator) probeHostsFromTargets(ctx context.Context, targets []target) []probedResult {
+	var results []probedResult
+	var resultsMu sync.Mutex
+
+	sem := make(chan struct{}, max(1, o.cfg.Concurrency))
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		t := t
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, ok := o.prober.Probe(ctx, t.fqdn, t.addr, t.port)
+			if !ok {
+				return
+			}
+			id := sshID(t.host, t.port)
+			resultsMu.Lock()
+			results = append(results, probedResult{id: id, source: "tailscale-ssh", host: t.host, fqdn: t.fqdn, addr: t.addr, port: t.port, res: res, docker: t.docker})
+			resultsMu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	return dedupeSameService(results)
 }

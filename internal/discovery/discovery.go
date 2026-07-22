@@ -108,6 +108,7 @@ func (o *Orchestrator) loopDelayed(ctx context.Context, startDelay, interval tim
 // Docker label metadata.
 type target struct {
 	host   string // display hostname
+	fqdn   string // full hostname from tailscale
 	addr   string // dial address
 	port   int
 	docker *DockerContainer

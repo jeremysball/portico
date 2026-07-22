@@ -11,6 +11,7 @@ import (
 // TailnetHost is one online node on the tailnet (including this machine).
 type TailnetHost struct {
 	Hostname string
+	FQDN     string
 	IPs      []netip.Addr
 	IsSelf   bool
 }
@@ -42,6 +43,7 @@ func (c *TailscaleClient) Hosts(ctx context.Context) ([]TailnetHost, error) {
 	if st.Self != nil && st.Self.Online {
 		hosts = append(hosts, TailnetHost{
 			Hostname: shortHostname(st.Self.HostName),
+			FQDN:     st.Self.HostName,
 			IPs:      st.Self.TailscaleIPs,
 			IsSelf:   true,
 		})
@@ -52,6 +54,7 @@ func (c *TailscaleClient) Hosts(ctx context.Context) ([]TailnetHost, error) {
 		}
 		hosts = append(hosts, TailnetHost{
 			Hostname: shortHostname(p.HostName),
+			FQDN:     p.HostName,
 			IPs:      p.TailscaleIPs,
 		})
 	}

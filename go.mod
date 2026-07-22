@@ -3,6 +3,11 @@ module github.com/jeremysball/portico
 go 1.26.4
 
 require (
+	golang.org/x/crypto v0.52.0
+	tailscale.com v1.100.0
+)
+
+require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/coder/websocket v1.8.12 // indirect
@@ -19,11 +24,9 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
-	tailscale.com v1.100.0 // indirect
 )

@@ -20,10 +20,10 @@ coming online, pushed to the browser live over SSE — no refresh needed.
 > **Note:** this repo (and therefore its GHCR package) is currently
 > **private**. The published-image pull below will only work for you and
 > anyone else with repo access until it's made public. Flipping the repo to
-> public does *not* automatically make the package public — that's a
+> public does *not* automatically make the package public. That's a
 > separate toggle under the package's own Settings → Danger Zone → Change
 > visibility on GHCR. If you don't have access, use the [Development](#development)
-> path instead — it builds from source and needs no image pull.
+> path instead; it builds from source and needs no image pull.
 
 ```sh
 curl -O https://raw.githubusercontent.com/jeremysball/portico/main/docker-compose.yml
@@ -119,7 +119,7 @@ flaky service doesn't flicker in and out of the page.
 ## Development
 
 `DATA_DIR` defaults to `/data`, which a non-root local user typically can't
-create or write to — set it to a local directory when running outside Docker:
+create or write to. Set it to a local directory when running outside Docker:
 
 ```sh
 go build ./...

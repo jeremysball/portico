@@ -20,7 +20,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock:ro
     environment:
-      - PORT=8888
+      - PORT=8080
       - SITE_TITLE=Home
       - DATA_DIR=/data
       - DISCOVERY_INTERVAL=5s
